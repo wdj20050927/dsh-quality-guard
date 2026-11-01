@@ -1,0 +1,101 @@
+[
+  {
+    "id": "audit-line-2",
+    "source": "audit.jsonl:2",
+    "at": "2026-10-31T11:05:08.165Z",
+    "turn": 3,
+    "judgeOutput": "{\"score\": 42, \"verdict\": \"fail\", \"wor",
+    "expectedScore": 42,
+    "expectedVerdict": "fail"
+  },
+  {
+    "id": "audit-line-7",
+    "source": "audit.jsonl:7",
+    "at": "2026-10-31T11:10:26.062Z",
+    "turn": 6,
+    "judgeOutput": "{\"score\": 55, \"verdict\": \"fail\", \"worst\": \"答3 的月下载量和 star 数、以及答1 的“999 token / 2,007 字 / 1,439 字”全是裸数字，没有 npm 包页或文件路径+行号之类可回查锚点，直接违反判据 4。\", \"fix\": \"给下载量/star 表每行补上 npm 包页和 GitHub 仓库链接（并注明查询日期），给“2,007",
+    "expectedScore": 55,
+    "expectedVerdict": "fail"
+  },
+  {
+    "id": "audit-line-8",
+    "source": "audit.jsonl:8",
+    "at": "2026-10-31T11:11:45.345Z",
+    "turn": 10,
+    "judgeOutput": "{\"score\": 55, \"verdict\": \"fail\", \"worst\": \"用户只说了「国际版可以国内版不行」，回复却把 32 段切分、9/9 复现、换 Cursor/Claude Code/OpenAI 对照这些没被问的排查过程全铺开，还带一张证据表和一堆 requestId，属于典型的旁支展开。\", \"fix\": \"删掉证据表、分段实验、复现次数、替换对照等全部排查细节，只留三句：国",
+    "expectedScore": 55,
+    "expectedVerdict": "fail"
+  },
+  {
+    "id": "audit-line-70",
+    "source": "audit.jsonl:70",
+    "at": "2026-10-31T12:55:37.710Z",
+    "turn": 26,
+    "judgeOutput": "",
+    "expectedScore": null,
+    "expectedVerdict": null
+  },
+  {
+    "id": "audit-line-87",
+    "source": "audit.jsonl:87",
+    "at": "2026-10-31T13:26:12.968Z",
+    "turn": 3,
+    "judgeOutput": "{\"score\": 90, \"verdict\": \"pass\", \"worst\": \"用户只问『再查』，回复主动展开了 21 个合规版、新旧备份等",
+    "expectedScore": 90,
+    "expectedVerdict": "pass"
+  },
+  {
+    "id": "audit-line-105",
+    "source": "audit.jsonl:105",
+    "at": "2026-10-31T13:53:35.224Z",
+    "turn": 8,
+    "judgeOutput": "",
+    "expectedScore": null,
+    "expectedVerdict": null
+  },
+  {
+    "id": "audit-line-114",
+    "source": "audit.jsonl:114",
+    "at": "2026-10-31T14:04:35.857Z",
+    "turn": 12,
+    "judgeOutput": "",
+    "expectedScore": null,
+    "expectedVerdict": null
+  },
+  {
+    "id": "audit-line-119",
+    "source": "audit.jsonl:119",
+    "at": "2026-10-31T14:08:30.973Z",
+    "turn": 13,
+    "judgeOutput": "{\"score\": 58, \"verdict\": \"fail\", \"worst\": \"整段回复像一条没有",
+    "expectedScore": 58,
+    "expectedVerdict": "fail"
+  },
+  {
+    "id": "audit-line-120",
+    "source": "audit.jsonl:120",
+    "at": "2026-10-31T14:08:56.781Z",
+    "turn": 14,
+    "judgeOutput": "",
+    "expectedScore": null,
+    "expectedVerdict": null
+  },
+  {
+    "id": "audit-line-170",
+    "source": "audit.jsonl:170",
+    "at": "2026-10-31T15:21:48.485Z",
+    "turn": 8,
+    "judgeOutput": "",
+    "expectedScore": null,
+    "expectedVerdict": null
+  },
+  {
+    "id": "audit-line-227",
+    "source": "audit.jsonl:227",
+    "at": "2026-11-01T01:16:39.953Z",
+    "turn": 14,
+    "judgeOutput": "",
+    "expectedScore": null,
+    "expectedVerdict": null
+  }
+]

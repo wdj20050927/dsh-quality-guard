@@ -1,5 +1,44 @@
 # 更新日志
 
+## v1.1.0 — 2026-11-01
+
+照 Anthropic 官方 [`anthropics/claude-cookbooks` 的 `capabilities/content_moderation`](https://github.com/anthropics/claude-cookbooks/tree/main/capabilities/content_moderation) 重做判官链路。核心变化一句话：**判官的分数只要吐出来了就必须被用上；吐不出来时不再假装它说了「通过」。**
+
+### 引擎 `engine/index.mjs`
+
+- **输出格式从 JSON 改成行式，分数第一行**（`SCORE: / VERDICT: / WORST: / FIX:`）。理由：截断只吃掉尾巴，吃不掉第一行。旧格式下 `{"score": 42, "verdict": "fa` 这种半截 JSON 会整条作废。
+- **`parseVerdict` 分四层抢救**（`scoreSource` 字段记录走了哪层）：
+  1. `lines` —— 行式 `SCORE:`（主路径）；
+  2. `json` —— 完整 JSON（判官习惯性吐 JSON 时也认）；
+  3. `salvage` —— 正则抠 `"score": 42`，**专救被截断在半路的 JSON**；
+  4. `verdict-only` —— 只写了 `VERDICT: fail` 没给数字，照样按不合格判（「宁可判不合格」）。
+  四层都拿不到才抛 `judge returned no score`。
+- **先解析、再判失败**：`runJudge` 不再一看到 `finish === 'error'` / `'aborted'` 就抛错，而是先尝试从已收到的文本里抢救分数。旧版顺序反了，导致「分数已经吐出来才断流」的判官输出被整条丢弃。
+- **补判一次**：第一次拿不到裁定就换更便宜的提示（只要一行 `SCORE:`，问题截 800 字、回复截 2500 字）再问一次，专救「理由写太长把 token 写光」。
+- **三值裁定 + Unknown 出口**：新增配置 `onUnknown`（`'pass'` 默认 / `'rework'`）。两次都拿不到裁定时审计记 `decision: "unknown"` + 原因；`onUnknown=rework` 时打回重写而不是静默放行。
+- **分数与 verdict 不再互相打架**：明确 `verdict=fail` 就回炉（哪怕分数高）；分数低于阈值也回炉（哪怕 `verdict=pass`）。
+- **审计新增字段**：`decision`（`pass` / `fail` / `unknown`）、`verdict`、`scoreSource`、`retried`、`onUnknown`。unknown 行也带 `error` 与诊断字段，不再是一句空话。
+
+### 回归集 `engine/fixtures/audit-regressions.json`
+
+- 从生产 `audit.jsonl` 导出全部 11 条 `judge returned no JSON` 原始判官输出（5 条带分数：42 / 55 / 55 / 90 / 58；6 条真空输出）。selftest 直接拿它们当夹具跑——**这是照着 Anthropic「评产出、按真实失败样本起步」那条做的**。
+- 同一套回归集跑 v1.0.1 的引擎：**4 条与预期相反**（42 / 55 / 55 / 58 全部本应打回却放行）；跑 v1.1.0：全部按分数正确裁定。
+
+### 面板 `panel/`
+
+- 新增「判官拿不到裁定时」二选一行（放行 / 打回重写），读写 `settings.onUnknown`。
+- `settings.js` 的 `defaults()` / `normalize()` / `FIELD_HELP` 与 `client.js` 的 `HELP` 同步；非法值退回默认而不是报错（面板不能因为一个字段把设置写坏）。
+
+### 测试
+
+- `node engine/selftest.mjs` → **100 passed, 0 failed**（v1.0.1 是 43）：新增行式解析、半截 JSON 抢救、断流但有分数、补判成功、unknown 出口、`onUnknown=rework`、verdict 与分数冲突、`verdict-only`、真实回归集 11 条等用例。
+
+### 已知限制
+
+- `onUnknown` 默认仍是 `'pass'`（与旧行为一致，避免一升级就满屏打回）。要宁严不宽请自己改成 `'rework'`。
+- 判官模型本身的能力没变：拿不到分数时最多补判一次，两次都空仍然只能走 unknown 出口。
+- 没有真模型的端到端验证：所有测试都是离线假 llm，真路由下的行为只靠审计事后看。
+
 ## v1.0.1 — 2026-11-01
 
 修掉「判官一个字都没吐，却被静默放行」这个坑：审计里原先只剩一句 `judge returned no JSON: `，分不清是超时被 abort 还是 token 被推理吃光。

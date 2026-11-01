@@ -219,7 +219,7 @@ console.log(`${name} selftest`)
   check('没有文本回复不回炉', h.steered.length === 0)
 }
 
-// 7. 判官调用抛错 → 放行，不弄坏会话
+// 7. 判官调用抛错 → 补判一次仍失败则放行，不弄坏会话
 {
   const h = harness({ dryRun: false }, fakeLlm(new Error('upstream 502')), baseEvents)
   await h.stop()
@@ -227,11 +227,14 @@ console.log(`${name} selftest`)
   check('判官抛错留了日志', h.warned.some((line) => line.includes('letting the turn close')), h.warned.join(' | '))
 }
 
-// 8. 判官返回非 JSON → 放行
+// 8. 判官返回非 JSON 也非分数 → 补判一次，仍拿不到就放行（v5：unknown 出口）
 {
-  const h = harness({ dryRun: false }, fakeLlm('我觉得还行吧'), baseEvents)
+  const llm = fakeLlm('我觉得还行吧')
+  const h = harness({ dryRun: false }, llm, baseEvents)
   await h.stop()
   check('非法输出则放行', h.steered.length === 0)
+  check('非法输出会补判一次', llm.calls.length === 2, `calls=${llm.calls.length}`)
+  check('补判的提示只要一行 SCORE', String(llm.calls[1]?.messages?.[0]?.content?.[0]?.text ?? '').includes('SCORE: 0-100'))
 }
 
 // 9. 没有路由 → 不调用，只 warn 一次
@@ -382,6 +385,193 @@ console.log(`${name} selftest`)
   check('正常判分记 textSource=text', row.textSource === 'text', JSON.stringify(row))
   check('正常判分记长度与耗时', row.textChars > 0 && Number.isFinite(row.judgeMs), JSON.stringify(row))
   fs.unlinkSync(audit)
+}
+
+// 22. v5：行式输出（分数第一行）能判，且审计记 scoreSource=lines
+{
+  const audit = tmpFile('audit-lines')
+  const h = harness(
+    { dryRun: false, auditFile: audit },
+    fakeLlm('SCORE: 30\nVERDICT: fail\nWORST: 先铺背景\nFIX: 结论前置'),
+    baseEvents,
+  )
+  await h.stop()
+  check('行式输出能判', h.steered.length === 1, `steered=${h.steered.length}`)
+  const row = lastAuditRow(audit)
+  check('审计记 scoreSource=lines', row.scoreSource === 'lines', JSON.stringify(row))
+  check('行式输出带上了 worst', row.worst === '先铺背景', JSON.stringify(row))
+  fs.unlinkSync(audit)
+}
+
+// 23. v5 核心：半截 JSON 里有分数 → 抢救出来按分数判，不再放行
+{
+  const audit = tmpFile('audit-truncated')
+  const h = harness(
+    { dryRun: false, auditFile: audit },
+    fakeLlm('{"score": 42, "verdict": "fail", "worst": "先铺了三段背'),
+    baseEvents,
+  )
+  await h.stop()
+  check('半截 JSON 也按分数打回', h.steered.length === 1, `steered=${h.steered.length}`)
+  const row = lastAuditRow(audit)
+  check('半截 JSON 记 scoreSource=salvage', row.scoreSource === 'salvage', JSON.stringify(row))
+  check('半截 JSON 分数是 42', row.score === 42, JSON.stringify(row))
+  check('半截 JSON 判为 fail', row.decision === 'fail', JSON.stringify(row))
+  fs.unlinkSync(audit)
+}
+
+// 24. v5 核心：分数已吐出来才 max-tokens 断流 → 照样按分数判，不当作「没产出」
+{
+  const audit = tmpFile('audit-trunc-score')
+  const h = harness(
+    { dryRun: false, auditFile: audit },
+    fakeLlmChunks([
+      { type: 'text-delta', index: 0, text: 'SCORE: 25\nVERDICT: fail\nWORST: 全是铺垫' },
+      { type: 'finish', reason: { kind: 'max-tokens' } },
+    ]),
+    baseEvents,
+  )
+  await h.stop()
+  check('断流但有分数就按分数判', h.steered.length === 1, `steered=${h.steered.length}`)
+  const row = lastAuditRow(audit)
+  check('断流判分记 finish=max-tokens', row.finish === 'max-tokens', JSON.stringify(row))
+  check('断流判分没有 error 字段', row.error === undefined, JSON.stringify(row))
+  fs.unlinkSync(audit)
+}
+
+// 25. v5：第一次拿不到分数，补判拿到分数 → 按补判的分数判
+{
+  const audit = tmpFile('audit-retry')
+  let call = 0
+  const llm = {
+    calls: [],
+    stream(options) {
+      this.calls.push(options)
+      call += 1
+      const body = call === 1 ? '我先想想……' : 'SCORE: 20'
+      return (async function* () {
+        yield { type: 'text-delta', index: 0, text: body }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      })()
+    },
+  }
+  const h = harness({ dryRun: false, auditFile: audit }, llm, baseEvents)
+  await h.stop()
+  check('补判拿到分数就回炉', h.steered.length === 1, `steered=${h.steered.length}`)
+  const row = lastAuditRow(audit)
+  check('审计记 retried=true', row.retried === true, JSON.stringify(row))
+  check('补判分数是 20', row.score === 20, JSON.stringify(row))
+  fs.unlinkSync(audit)
+}
+
+// 26. v5：两次都拿不到 → onUnknown=pass 放行，但审计留下 decision=unknown
+{
+  const audit = tmpFile('audit-unknown')
+  const h = harness({ dryRun: false, auditFile: audit }, fakeLlm('我不知道'), baseEvents)
+  await h.stop()
+  check('unknown 默认放行', h.steered.length === 0, `steered=${h.steered.length}`)
+  const row = lastAuditRow(audit)
+  check('unknown 写进审计', row.decision === 'unknown', JSON.stringify(row))
+  check('unknown 审计带原因', String(row.error ?? '').includes('no score'), JSON.stringify(row))
+  fs.unlinkSync(audit)
+}
+
+// 27. v5：onUnknown=rework 时 unknown 真的打回
+{
+  const h = harness({ dryRun: false, onUnknown: 'rework' }, fakeLlm('我不知道'), baseEvents)
+  await h.stop()
+  check('onUnknown=rework 会打回', h.steered.length === 1, `steered=${h.steered.length}`)
+  check('unknown 打回文案不说分数', String(h.steered[0]?.content?.[0]?.text ?? '').includes('没给出可用的判定'))
+}
+
+// 28. v5：onUnknown 只接受 pass / rework
+{
+  let threw
+  try {
+    harness({ onUnknown: 'ignore' }, fakeLlm(PASS_VERDICT), baseEvents)
+  } catch (error) {
+    threw = error
+  }
+  check('非法 onUnknown 报错', threw instanceof TypeError && String(threw.message).includes('onUnknown'))
+}
+
+// 29. v5：分数够高但 verdict=fail（判官自相矛盾）→ 以 fail 为准，宁严不宽
+{
+  const audit = tmpFile('audit-conflict')
+  const h = harness({ dryRun: false, auditFile: audit }, fakeLlm({ score: 88, verdict: 'fail', worst: '答偏了' }), baseEvents)
+  await h.stop()
+  check('明确 fail 就回炉（即使分数高）', h.steered.length === 1, `steered=${h.steered.length}`)
+  fs.unlinkSync(audit)
+}
+
+// 30. v5：分数够低但 verdict=pass → 以分数为准打回
+{
+  const h = harness({ dryRun: false }, fakeLlm({ score: 40, verdict: 'pass' }), baseEvents)
+  await h.stop()
+  check('分数低于阈值就回炉（即使 verdict=pass）', h.steered.length === 1, `steered=${h.steered.length}`)
+}
+
+/**
+ * 真实漏判回归集：从生产审计里挖出来的 11 条 `judge returned no JSON`。
+ *
+ * 这 11 条是 v1.0.1 之前的真实翻车——其中 5 条判官其实已经把分数写出来了
+ * （42 / 55 / 55 / 90 / 58），只是 JSON 被截断，旧版 parseVerdict 整条作废、
+ * 于是 4 条本该打回的回复被放行。fixtures 文件由 audit.jsonl 原样导出，
+ * 跑法见 `engine/fixtures/audit-regressions.json`。
+ *
+ * 断言的是**行为**而不是实现：给了分数就必须按分数判，没给分数才允许 unknown。
+ */
+{
+  const fixturePath = new URL('./fixtures/audit-regressions.json', import.meta.url)
+  const cases = JSON.parse(fs.readFileSync(fixturePath, 'utf8'))
+  let scored = 0
+  let unknown = 0
+  for (const item of cases) {
+    const audit = tmpFile('audit-reg')
+    const h = harness({ dryRun: false, auditFile: audit }, fakeLlm(item.judgeOutput), baseEvents)
+    await h.stop()
+    const row = lastAuditRow(audit)
+    if (item.expectedScore === null) {
+      // 判官什么都没说出来：补判一次也空 → unknown 出口，默认放行但审计留痕。
+      unknown += 1
+      check(`${item.id}: 空输出走 unknown 出口`, row.decision === 'unknown', JSON.stringify(row))
+      check(`${item.id}: 空输出不静默回炉`, h.steered.length === 0, `steered=${h.steered.length}`)
+    } else {
+      scored += 1
+      check(`${item.id}: 抢救出 ${item.expectedScore} 分`, row.score === item.expectedScore, JSON.stringify(row))
+      check(`${item.id}: 按分数判 ${item.expectedScore >= 70 ? 'pass' : 'fail'}`, row.decision === (item.expectedScore >= 70 ? 'pass' : 'fail'), JSON.stringify(row))
+      const shouldRework = item.expectedScore < 70
+      check(
+        `${item.id}: ${shouldRework ? '真的打回了' : '没有误打回'}`,
+        h.steered.length === (shouldRework ? 1 : 0),
+        `steered=${h.steered.length}`,
+      )
+    }
+    fs.unlinkSync(audit)
+  }
+  console.log(`  -- 回归集：${cases.length} 条（带分数 ${scored} / 空输出 ${unknown}）`)
+}
+
+// 31. v5：判官只说了 fail、没给数字 → 仍然打回（宁可判不合格）
+{
+  const audit = tmpFile('audit-verdict-only')
+  const h = harness({ dryRun: false, auditFile: audit }, fakeLlm('VERDICT: fail\nWORST: 旁支太多'), baseEvents)
+  await h.stop()
+  check('只说 fail 没分数也打回', h.steered.length === 1, `steered=${h.steered.length}`)
+  const row = lastAuditRow(audit)
+  check('只给 verdict 时记 scoreSource=verdict-only', row.scoreSource === 'verdict-only', JSON.stringify(row))
+  check('只给 verdict 时审计不记 score', row.score === undefined, JSON.stringify(row))
+  check('只给 verdict 时判为 fail', row.decision === 'fail', JSON.stringify(row))
+  check('打回文案不编造分数', String(h.steered[0]?.content?.[0]?.text ?? '').includes('判官判定不合格'))
+  fs.unlinkSync(audit)
+}
+
+// 32. v5：判官只说了 pass、没给数字 → 没有依据的放行不接受，走补判后 unknown
+{
+  const h = harness({ dryRun: false }, fakeLlm('VERDICT: pass'), baseEvents)
+  await h.stop()
+  check('只说 pass 没分数不算数', h.steered.length === 0, `steered=${h.steered.length}`)
+  check('只说 pass 会触发补判', h.warned.some((line) => line.includes('onUnknown=pass')), h.warned.join(' | '))
 }
 
 console.log(`\n${passed} passed, ${failed} failed`)

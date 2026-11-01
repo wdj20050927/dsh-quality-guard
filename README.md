@@ -42,16 +42,16 @@ sequenceDiagram
     A->>E: 轮次将结束（agent/turn-stopping）
     E->>E: 读 settings.json（mtime:size 缓存 key）
     E->>J: 判据 + 原问题 + 草稿
-    J-->>E: {verdict, score, worst, fix}
+    J-->>E: SCORE / VERDICT / WORST / FIX（分数第一行）
     alt 不及格 且 reworks < maxReworks
         E->>A: steer：按 fix 重写
         A->>E: 轮次再次将结束
-    else 及格 / 到上限 / 任何异常
-        E-->>U: 放行
+    else 及格 / 到上限 / 判官两次都没给裁定（unknown 出口）
+        E-->>U: 放行（onUnknown=rework 时打回）
     end
 ```
 
-判官拿不到 llm、超时、报错、没有路由——全部走右边的放行分支（fail-open）。
+判官拿不到 llm、超时、报错、没有路由——仍然走放行分支（fail-open）。但**判官已经吐出来的分数不会被丢掉**：断流、`max-tokens`、半截 JSON 都先抢救分数，拿不到分数才补判一次，两次都空才进 unknown 出口。
 
 ## 安装
 
@@ -121,6 +121,7 @@ patch 里再追加一条按**包名**挂的：
 | `judge.timeoutMs` | 判官超时就放弃，本条放行 | 1000–120000 | `60000` | `60000` |
 | `judge.maxTokens` | 判官最多能输出多少 token | 64–8000 | `4000` | `4000` |
 | `judge.model` | 指定判官模型 `{provider, model}`；留空＝沿用当前会话的路由 | — | `null` | `null` |
+| `onUnknown` | 判官两次都拿不到裁定（超时/断流/空输出）时：`pass` 放行，`rework` 打回重写 | `pass` \| `rework` | `pass` | `pass` |
 | `auditFile` | 审计日志落点；**空字符串＝不写** | — | — | `~/.dsh/quality-guard/audit.jsonl` |
 | `settingsFile` | 活设置文件落点 | — | — | — |
 | `criteriaFile` | 判据文本文件；仅在活设置里没有 `criteria` 数组时启用 | — | — | — |
@@ -153,9 +154,9 @@ patch 里再追加一条按**包名**挂的：
 
 **打回时界面上会多留一条旧回复。** 打回走 `agent.steer()`，而旧回复在这之前已经按 `surfaceOp: "append"` 落盘了，界面只收 append——改不了。设计取舍：你能同时对照看「长版」和「短版」。真要只保留最后一版，得改挂 `llm/stream`、攒完整条再判，那会牺牲流式体感。
 
-**一切失败都放行（fail-open）。** 判官超时、报错、拿不到 llm 服务、没有模型路由、`settings.json` 读坏——全部跳过检查继续会话。质检绝不该把会话卡住。
+**一切失败都放行（fail-open），但「失败」的定义收窄了（v1.1.0）。** 判官超时、报错、拿不到 llm 服务、没有模型路由、`settings.json` 读坏——仍然跳过检查继续会话。质检绝不该把会话卡住。但**判官已经吐出来的分数不再被当成失败丢掉**：断流、`max-tokens`、半截 JSON，只要分数写出来了就按分数判；拿不到分数还会换一个更便宜的提示补判一次；两次都没有才走 unknown 出口（审计记 `decision: "unknown"`，`onUnknown=rework` 时打回重写）。
 
-**判官 `maxTokens` 别调回 800。** 判官要输出 JSON，800 会被截断，表现为日志里 `judge returned no JSON`，然后整条 fail-open 放行——看起来「没报错」，实际是压根没判。默认已提到 4000。
+**判官 `maxTokens` 别调回 800。** 判官要输出行式 `SCORE: / VERDICT: / WORST: / FIX:`，800 会被截断（v1.1.0 起分数在第一行，截断只吃掉尾巴，所以不再是致命的，但理由会缺）。默认 4000。
 
 **「一个字都没吐」现在查得出来了（v1.0.1）。** 引擎原先只收 `text-delta`，也只把 `finish.kind === 'error'` 当错；可超时 abort 在 SDK 里报的是 `aborted`，token 被推理吃光报的是 `max-tokens`——两种都静悄悄走到「空文本 → 放行」。现在：`aborted` 当显式超时、文本为空时从 `reasoning-delta` 里再捞一次 JSON、审计补上 `finish` / `judgeMs` / `textChars` / `reasonChars` / `textSource`。兜底默认同步提到 `timeoutMs 60000`、`maxTokens 4000`。
 
@@ -171,7 +172,8 @@ patch 里再追加一条按**包名**挂的：
 {"at":"…","turn":12,"session":"…","score":45,"failed":true,
  "worst":"只说『继续』，回复却甩出完整问题复盘…","fix":"先给结论，删掉没问的旁支…",
  "rework":0,"dryRun":false,"route":"…/…","chars":1180,
- "finish":"stop","judgeMs":4210,"textChars":96,"reasonChars":0,"textSource":"text"}
+ "finish":"stop","judgeMs":4210,"textChars":96,"reasonChars":0,"textSource":"text",
+ "verdict":"fail","decision":"fail","scoreSource":"lines","retried":false}
 ```
 
 `worst` / `fix` 是判官写的原话，等于把你的对话摘要留在了磁盘上。所以：
@@ -186,10 +188,12 @@ patch 里再追加一条按**包名**挂的：
 
 ```bash
 node engine/selftest.mjs
-# → 43 passed, 0 failed
+# → 100 passed, 0 failed
 ```
 
-用假 llm，不联网、不花钱，覆盖：判据拼装、超时/报错放行、`maxReworks` 上限、`dryRun`、外部判据文件、活动设置覆盖 patch，以及 v1.0.1 的三种判官异常（JSON 全在 reasoning、`aborted`、`max-tokens` 空产出）与审计诊断字段。
+用假 llm，不联网、不花钱，覆盖：判据拼装、超时/报错放行、`maxReworks` 上限、`dryRun`、外部判据文件、活动设置覆盖 patch、v1.0.1 的三种判官异常（JSON 全在 reasoning、`aborted`、`max-tokens` 空产出）与审计诊断字段，以及 v1.1.0 的分层抢救（行式 / 完整 JSON / 截断 JSON / 只给 verdict）、补判、unknown 出口、`onUnknown=rework`。
+
+`engine/fixtures/audit-regressions.json` 是从生产审计里导出的 **11 条真实漏判**原始判官输出，selftest 会逐条跑。同一套夹具跑 v1.0.1 的引擎是 4 条与预期相反（42 / 55 / 55 / 58 全部该打回却放行），跑当前版本全部正确。
 
 ---
 

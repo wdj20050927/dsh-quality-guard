@@ -110,6 +110,19 @@ window.__ModuleLoader__.load({
 }
 .qg-num:focus { border-color: var(--dsw-alias-state-business-primary); }
 .qg-unit { flex: none; color: var(--dsw-alias-label-tertiary); font-size: 12px; width: 26px; }
+.qg-choice { flex: none; display: flex; gap: 6px; }
+.qg-choice-btn {
+  font-size: 12px; padding: 5px 10px; border-radius: 8px; cursor: pointer;
+  color: var(--dsw-alias-label-secondary);
+  background: var(--dsw-specific-input-major, var(--dsw-alias-bg-layer-2));
+  border: 1px solid var(--dsw-alias-border-l2);
+  font-family: inherit;
+}
+.qg-choice-btn.on {
+  color: var(--dsw-alias-label-primary);
+  border-color: var(--dsw-alias-state-business-primary);
+  background: var(--dsw-alias-bg-layer-3);
+}
 .qg-card {
   border: 1px solid var(--dsw-alias-border-l1);
   border-radius: 10px; padding: 10px 12px; margin-bottom: 10px;
@@ -272,6 +285,7 @@ window.__ModuleLoader__.load({
         },
         criteria: settings.criteria.map((item) => ({ ...item })),
         exceptions: settings.exceptions,
+        onUnknown: settings.onUnknown === 'rework' ? 'rework' : 'pass',
       }
     }
 
@@ -308,6 +322,7 @@ window.__ModuleLoader__.load({
         },
         criteria,
         exceptions: draft.exceptions,
+        onUnknown: draft.onUnknown === 'rework' ? 'rework' : 'pass',
       }
     }
 
@@ -317,6 +332,7 @@ window.__ModuleLoader__.load({
       minReplyChars: '回复短于这个字数就跳过。0＝每条都查（连「好的」也查）。',
       maxReworks: '同一条回复最多被打回几次，防死循环。0＝永不回炉。',
       scoreThreshold: '判官打分（0-100）低于这条线就算不过。',
+      onUnknown: '判官两次都拿不到裁定（超时、断流、空输出）时怎么办。放行＝旧行为，风险是漏判；打回＝宁严不宽，会多花一轮。',
       timeoutMs: '判官超过这么久没回话就放弃，本条放行。',
       maxTokens: '判官最多能输出多少 token。',
     }
@@ -365,6 +381,36 @@ window.__ModuleLoader__.load({
           help ? h('div', { className: 'qg-row-help' }, help) : null,
         ),
         h(Switch, { checked, onChange }),
+      )
+    }
+
+    /** 二选一的行（v5 的 onUnknown 用）：两个按钮，选中的那个高亮。 */
+    function ChoiceRow({ title, help, value, options, onChange }) {
+      return h(
+        'div',
+        { className: 'qg-row' },
+        h(
+          'div',
+          { className: 'qg-row-main' },
+          h('div', { className: 'qg-row-title' }, title),
+          help ? h('div', { className: 'qg-row-help' }, help) : null,
+        ),
+        h(
+          'div',
+          { className: 'qg-choice' },
+          options.map((option) =>
+            h(
+              'button',
+              {
+                key: option.value,
+                type: 'button',
+                className: `qg-choice-btn${value === option.value ? ' on' : ''}`,
+                onClick: () => onChange(option.value),
+              },
+              option.label,
+            ),
+          ),
+        ),
       )
     }
 
@@ -709,6 +755,16 @@ window.__ModuleLoader__.load({
               max: 8000,
               unit: 'tok',
               onChange: (value) => patchDraft((next) => { next.judge.maxTokens = value }),
+            }),
+            h(ChoiceRow, {
+              title: '判官拿不到裁定时',
+              help: HELP.onUnknown,
+              value: draft.onUnknown,
+              options: [
+                { value: 'pass', label: '放行' },
+                { value: 'rework', label: '打回重写' },
+              ],
+              onChange: (value) => patchDraft((next) => { next.onUnknown = value }),
             }),
             h(
               'div',

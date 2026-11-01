@@ -69,6 +69,9 @@ export function defaults() {
     // 800 会把判官的 JSON 截断（实测 7 条审计里 2 条 "judge returned no JSON"），v1.0.1 起提到 4000。
     // 超时同步提到 60s：20s 时有过「abort 后一个字都没吐」，而 abort 在 SDK 里不报 error，引擎看不出来。
     judge: { timeoutMs: 60000, maxTokens: 4000, model: null },
+    // 判官两次都拿不到裁定时的出口（v5 三值逻辑的 unknown）：
+    // 'pass' ＝ 放行（旧行为，风险是漏判）；'rework' ＝ 打回重写（宁严不宽）。
+    onUnknown: 'pass',
     criteria: DEFAULT_CRITERIA.map((item) => ({ ...item })),
     exceptions: DEFAULT_EXCEPTIONS,
     auditFile: AUDIT_FILE.replace(/\\/g, '/'),
@@ -83,6 +86,7 @@ export const FIELD_HELP = {
   minReplyChars: '回复短于这个字数就跳过检查。0＝每条都查（连「好的」也查）。',
   maxReworks: '同一条回复最多被打回几次，防死循环。0＝永不回炉。',
   scoreThreshold: '判官打分的及格线（0-100）。低于它就算不过。',
+  onUnknown: '判官两次都拿不到裁定（超时、断流、空输出）时怎么办。放行＝旧行为，风险是漏判；打回＝宁严不宽，会多花一轮。',
   timeoutMs: '判官超过这么久没回话就放弃，本条放行。',
   maxTokens: '判官最多能输出多少 token。',
   criteria: '判官手里那张尺子。勾掉＝这一条不再检查。',
@@ -179,6 +183,7 @@ export function normalize(input) {
     },
     criteria,
     exceptions: exceptions.trim(),
+    onUnknown: input.onUnknown === 'rework' ? 'rework' : input.onUnknown === 'pass' ? 'pass' : base.onUnknown,
     auditFile: auditFile.replace(/\\/g, '/'),
     updatedAt: typeof input.updatedAt === 'string' ? input.updatedAt : null,
   }

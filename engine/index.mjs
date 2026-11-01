@@ -29,6 +29,18 @@
  *  现在：也收 `reasoning-delta`（文本为空时从推理里捞 JSON）、`aborted` 当显式超时、
  *  审计补 `finish`/`judgeMs`/`textChars`/`reasonChars`/`textSource`，
  *  兜底默认提到 `timeoutMs 60000`、`maxTokens 4000`。
+ *
+ * v5（2026-11-01）：学 anthropics/content_moderation 的三值逻辑，把「拿不到裁定就放行」改成显式 UNKNOWN。
+ *  实测 269 行审计里 11 行 `judge returned no JSON`，其中 5 行半截 JSON 已经带了分数、4 行分数低于阈值
+ *  ——它们本该被打回，却因为 `JSON.parse` 要一个完整的 `}` 而被静默放行。这是**漏判**，不是噪音。
+ *  三处改动：
+ *  1. **先给分，再给理由**：判官改成行式输出（`SCORE:` 是第一行），截断先吃掉 worst/fix，吃不掉分数；
+ *     解析器分层兜底（行式 → JSON → 正则抢救），且**只要抢救到分数就按分数判**，不再要求完整 JSON。
+ *  2. **分数优先于 finish**：`error`/`aborted` 也可能是「已经吐出分数才断的」，先解析，拿到分数就不抛。
+ *  3. **三值裁定**：`pass | fail | unknown`。unknown 不再默认放行——先补判一次（只让判官补输出分数行），
+ *     仍拿不到就按 `onUnknown` 处置（默认 `pass`，可设 `rework`）。unknown 一律写进审计，可回查。
+ *  出处：anthropics/claude-cookbooks `capabilities/content_moderation/engine.py` 的
+ *  「Any unknown that would matter yields decision `needs_review` rather than a confident verdict」。
  */
 
 /** Cordis plugin name used by loader diagnostics. */
@@ -48,6 +60,7 @@ const ALLOWED_KEYS = new Set([
   'maxTokens',
   'minReplyChars',
   'scoreThreshold',
+  'onUnknown',
   'auditFile',
   'criteriaFile',
   'settingsFile',
@@ -153,7 +166,13 @@ function lastRoute(session) {
   return undefined
 }
 
-/** 拼给判官的原文（两段都截断，避免把一整个文件塞进判官）。 */
+/**
+ * 拼给判官的原文（两段都截断，避免把一整个文件塞进判官）。
+ *
+ * v5 起要的是**行式输出且分数第一行**：截断只吃掉尾巴，吃不掉已经写出来的分数。
+ * 旧版要一个完整 JSON，`{"score": 42, "verdict": "fa` 这种半截就整条作废——实测 5 条审计
+ * 里半截 JSON 已经带了分数，4 条低于阈值却因此被放行。
+ */
 function judgePrompt(question, reply, criteria = CRITERIA) {
   const clip = (text, limit) => (text.length <= limit ? text : `${text.slice(0, limit)}\n……（后略 ${text.length - limit} 字）`)
   return [
@@ -165,26 +184,107 @@ function judgePrompt(question, reply, criteria = CRITERIA) {
     '',
     criteria,
     '',
-    '只输出一个 JSON 对象，不要任何其他文字、不要代码块围栏：',
-    '{"score": 0-100 的整数（100 = 完全符合全部判据）, "verdict": "pass" | "fail", "worst": "最严重的那一条问题，一句话", "fix": "具体怎么改，一句话，可执行"}',
+    '只输出下面四行，不要任何其他文字、不要 JSON、不要代码块围栏。第一行必须是 SCORE：',
+    'SCORE: 0-100 的整数（100 = 完全符合全部判据）',
+    'VERDICT: pass 或 fail',
+    'WORST: 最严重的那一条问题，一句话',
+    'FIX: 具体怎么改，一句话，可执行',
   ].join('\n')
 }
 
-/** 从模型输出里抠出那个 JSON（容忍它多说了几句或包了代码块）。 */
+/** 行式输出：`SCORE: 62`（容忍 markdown 的 `-`/`*`/`>` 前缀与全角冒号）。 */
+const SCORE_LINE = /^[ \t>*\-]*SCORE[ \t]*[:：][ \t]*(\d{1,3})/im
+const VERDICT_LINE = /^[ \t>*\-]*VERDICT[ \t]*[:：][ \t]*(pass|fail)/im
+const WORST_LINE = /^[ \t>*\-]*WORST[ \t]*[:：][ \t]*(.+)$/im
+const FIX_LINE = /^[ \t>*\-]*FIX[ \t]*[:：][ \t]*(.+)$/im
+/** 兜底抢救：任何位置出现 `"score": 42` 都认（含被截断的 JSON）。 */
+const SCORE_JSON = /"score"\s*:\s*"?(\d{1,3})"?/i
+const VERDICT_JSON = /"verdict"\s*:\s*"(pass|fail)"/i
+
+const clampScore = (value) => Math.min(100, Math.max(0, value))
+
+/**
+ * 从模型输出里抠出裁定。三层兜底，**任何一层拿到分数就算数**：
+ *  1. 行式 `SCORE:`（v5 的主格式，分数在第一行，最抗截断）；
+ *  2. 完整 JSON（老格式，判官习惯性吐 JSON 时也认）；
+ *  3. 正则抢救 `"score": 42`（JSON 被截断在半路上时的唯一活路）。
+ * 三层都拿不到分数才抛错——那才是真的「判官什么都没说」。
+ */
 function parseVerdict(text) {
   const raw = String(text ?? '')
+  const pick = (pattern) => {
+    const match = pattern.exec(raw)
+    return match === null ? undefined : match[1]
+  }
+  const build = (score, verdict, worst, fix, scoreSource) => ({
+    score: clampScore(score),
+    verdict: verdict === undefined ? 'unknown' : verdict.toLowerCase(),
+    worst: worst ?? '',
+    fix: fix ?? '',
+    scoreSource,
+  })
+
+  const lineScore = pick(SCORE_LINE)
+  if (lineScore !== undefined) {
+    return build(
+      Number(lineScore),
+      pick(VERDICT_LINE),
+      pick(WORST_LINE)?.trim(),
+      pick(FIX_LINE)?.trim(),
+      'lines',
+    )
+  }
+
   const start = raw.indexOf('{')
   const end = raw.lastIndexOf('}')
-  if (start < 0 || end <= start) throw new Error(`judge returned no JSON: ${raw.slice(0, 200)}`)
-  const parsed = JSON.parse(raw.slice(start, end + 1))
-  const score = Number(parsed?.score)
-  if (!Number.isFinite(score)) throw new Error('judge returned no numeric score')
-  return {
-    score,
-    verdict: parsed?.verdict === 'fail' ? 'fail' : 'pass',
-    worst: typeof parsed?.worst === 'string' ? parsed.worst : '',
-    fix: typeof parsed?.fix === 'string' ? parsed.fix : '',
+  if (start >= 0 && end > start) {
+    try {
+      const parsed = JSON.parse(raw.slice(start, end + 1))
+      const score = Number(parsed?.score)
+      if (Number.isFinite(score)) {
+        const verdict = parsed?.verdict === 'fail' || parsed?.verdict === 'pass' ? parsed.verdict : undefined
+        return build(
+          score,
+          verdict,
+          typeof parsed?.worst === 'string' ? parsed.worst : undefined,
+          typeof parsed?.fix === 'string' ? parsed.fix : undefined,
+          'json',
+        )
+      }
+    } catch {
+      // 半截 JSON：交给第三层抢救。
+    }
   }
+
+  const salvageScore = pick(SCORE_JSON)
+  if (salvageScore !== undefined) {
+    return build(
+      Number(salvageScore),
+      pick(VERDICT_JSON),
+      undefined,
+      undefined,
+      'salvage',
+    )
+  }
+
+  /**
+   * 最后一条：判官明确写了 fail，只是没给数字。
+   * 「宁可判不合格」——明确说了不合格，不该因为缺个数字就放行。
+   * 这条只在 verdict 是 fail 时生效；写了 pass 却没分数不算数（没有依据的放行不接受）。
+   */
+  const explicitVerdict = (pick(VERDICT_LINE) ?? pick(VERDICT_JSON) ?? '').toLowerCase()
+  if (explicitVerdict === 'fail') {
+    return {
+      score: undefined,
+      verdict: 'fail',
+      worst: pick(WORST_LINE)?.trim() ?? '',
+      fix: pick(FIX_LINE)?.trim() ?? '',
+      scoreSource: 'verdict-only',
+    }
+  }
+
+  const preview = raw.trim() === '' ? '（空输出）' : raw.slice(0, 200)
+  throw new Error(`judge returned no score: ${preview}`)
 }
 
 /** finish 原因折成审计里能读的一个词。 */
@@ -207,12 +307,11 @@ function salvageText(text, reasoning) {
 /**
  * 调一次判官，返回它的裁定（外加这次调用的诊断字段）。
  *
- * v4 起，失败不再只留一句 `judge returned no JSON: `：
- *  - `finish.kind === 'aborted'`（超时 abort 走这条，SDK 不报 error）→ 抛显式超时错误；
- *  - 文本空但推理里有 JSON → 捞出来照判；
- *  - 抛出的错误挂 `error.judge`，调用方写进审计，好分清「超时」和「token 吃光」。
+ * v5 起**先解析、再判失败**：`finish === 'error'` / `'aborted'` 也可能是「分数已经吐出来了才断的」，
+ * 旧版先抛错就把已经写出来的分数丢了（实测 11 条漏判全是这么来的）。
+ * 顺序：解析 → 有分数就返回 → 没分数才按 finish 抛显式原因。
  */
-async function runJudge(llm, route, question, reply, settings, criteria = CRITERIA) {
+async function runJudge(llm, route, promptText, settings) {
   const controller = new AbortController()
   const started = Date.now()
   const timer = setTimeout(() => controller.abort(), settings.timeoutMs)
@@ -235,7 +334,7 @@ async function runJudge(llm, route, question, reply, settings, criteria = CRITER
       provider: route.provider,
       model: route.model,
       system: JUDGE_SYSTEM,
-      messages: [{ role: 'user', content: [{ type: 'text', text: judgePrompt(question, reply, criteria) }] }],
+      messages: [{ role: 'user', content: [{ type: 'text', text: promptText }] }],
       maxTokens: settings.maxTokens,
       signal: controller.signal,
     })
@@ -248,36 +347,80 @@ async function runJudge(llm, route, question, reply, settings, criteria = CRITER
     clearTimeout(timer)
   }
   const info = meta()
+  const picked = salvageText(text, reasoning)
+
+  // 先抢救分数：流断了不代表它没给过分。
+  let verdict
+  let parseError
+  try {
+    verdict = parseVerdict(picked.text)
+  } catch (error) {
+    parseError = error
+  }
+  if (verdict !== undefined) {
+    return { ...verdict, ...info, textSource: picked.source }
+  }
+
   if (info.finish === 'error') {
     throw fail(`judge stream failed: ${String(finish?.failure?.message ?? 'unknown')} [${info.judgeMs}ms]`)
   }
   if (info.finish === 'aborted') {
     throw fail(`judge aborted after ${info.judgeMs}ms (timeoutMs=${settings.timeoutMs})`)
   }
-  const picked = salvageText(text, reasoning)
   if (picked.text.trim() === '') {
     throw fail(
       `judge produced no text (finish=${info.finish}, ${info.judgeMs}ms, reasonChars=${info.reasonChars}, maxTokens=${settings.maxTokens})`,
     )
   }
-  try {
-    return { ...parseVerdict(picked.text), ...info, textSource: picked.source }
-  } catch (error) {
-    throw fail(
-      `${String((error && error.message) || error)} [finish=${info.finish}, ${info.judgeMs}ms, textChars=${info.textChars}, reasonChars=${info.reasonChars}]`,
-    )
-  }
+  throw fail(
+    `${String((parseError && parseError.message) || parseError)} [finish=${info.finish}, ${info.judgeMs}ms, textChars=${info.textChars}, reasonChars=${info.reasonChars}]`,
+  )
+}
+
+/**
+ * 补判用的短提示：只要一个分数。
+ *
+ * 三值逻辑的「Unknown 出口」在 anthropics 那边是「转人工」；我们没有人工，
+ * 于是先给判官**第二次、更便宜的机会**——只让它输出一行 `SCORE:`，连理由都不要。
+ * 这一步专门救「理由写太长把 token 写光」「推理把 token 吃光」这两类漏判。
+ */
+function scorePrompt(question, reply, criteria = CRITERIA) {
+  const clip = (text, limit) => (text.length <= limit ? text : `${text.slice(0, limit)}\n……（后略 ${text.length - limit} 字）`)
+  return [
+    '【用户的问题】',
+    question === undefined ? '（未找到，第 1、5 条按不适用处理）' : clip(question, 800),
+    '',
+    '【助手即将发出的回复】',
+    clip(reply, 2500),
+    '',
+    criteria,
+    '',
+    '只输出一行，不要任何解释、不要 JSON、不要代码块围栏：',
+    'SCORE: 0-100 的整数（100 = 完全符合全部判据）',
+  ].join('\n')
 }
 
 /** 回炉时塞回去的那条消息。 */
 function notice(verdict, attempt, maxReworks) {
+  const head =
+    verdict.score === undefined
+      ? `【质检未过·判官判定不合格·已被打回第 ${attempt}/${maxReworks} 轮】`
+      : `【质检未过·${verdict.score} 分·已被打回第 ${attempt}/${maxReworks} 轮】`
   const lines = [
-    `【质检未过·${verdict.score} 分·已被打回第 ${attempt}/${maxReworks} 轮】`,
+    head,
     verdict.worst === '' ? '这段回复不是用户要的样子。' : verdict.worst,
     verdict.fix === '' ? '' : `改法：${verdict.fix}`,
     '按用户的要求重写这条回复：最核心的那一点先说，用最直白的话讲；删掉铺垫、背景、他没问的旁支；数值和文献出处一条不少。',
   ]
   return lines.filter((line) => line !== '').join('\n')
+}
+
+/** 三值裁定里 unknown 落到 rework 时的文案（不带分数，因为真没有分数）。 */
+function noticeUnknown(attempt, maxReworks) {
+  return [
+    `【质检未过·判官这一轮没给出可用的判定·已被打回第 ${attempt}/${maxReworks} 轮】`,
+    '按用户的要求重写这条回复：最核心的那一点先说，用最直白的话讲；删掉铺垫、背景、他没问的旁支；数值和文献出处一条不少。',
+  ].join('\n')
 }
 
 /** Register the semantic self-check guard. */
@@ -312,6 +455,7 @@ export function apply(ctx, config) {
     maxTokens: int('maxTokens', 4000, 64),
     minReplyChars: int('minReplyChars', 0, 0),
     scoreThreshold: int('scoreThreshold', 70, 0),
+    onUnknown: 'pass',
     auditFile: '',
     criteriaFile: '',
     settingsFile: '',
@@ -328,6 +472,12 @@ export function apply(ctx, config) {
   if (source.criteriaFile !== undefined) {
     if (typeof source.criteriaFile !== 'string') throw new TypeError(`${name}: criteriaFile must be a string`)
     settings.criteriaFile = source.criteriaFile
+  }
+  if (source.onUnknown !== undefined) {
+    if (source.onUnknown !== 'pass' && source.onUnknown !== 'rework') {
+      throw new TypeError(`${name}: onUnknown must be 'pass' or 'rework'`)
+    }
+    settings.onUnknown = source.onUnknown
   }
   if (source.model !== undefined) {
     const model = source.model
@@ -497,6 +647,7 @@ export function apply(ctx, config) {
         scoreThreshold: pickInt(triggers.scoreThreshold, settings.scoreThreshold, 0, 100),
         timeoutMs: pickInt(judge.timeoutMs, settings.timeoutMs, 1000, 120000),
         maxTokens: pickInt(judge.maxTokens, settings.maxTokens, 64, 8000),
+        onUnknown: parsed.onUnknown === 'rework' ? 'rework' : parsed.onUnknown === 'pass' ? 'pass' : settings.onUnknown,
         model: model ?? settings.model,
         auditFile: typeof parsed.auditFile === 'string' ? parsed.auditFile : settings.auditFile,
         criteria: Array.isArray(parsed.criteria)
@@ -550,20 +701,88 @@ export function apply(ctx, config) {
         return
       }
 
-      const verdict = await runJudge(llm, route, exchange.question, exchange.reply, live, live.criteria)
-      const failed = verdict.verdict === 'fail' || verdict.score < live.scoreThreshold
+      /**
+       * 判一次；拿不到分数就**换更便宜的提示补判一次**（只要一行 SCORE）。
+       * v5 的三值逻辑：unknown 不是「放行」的同义词，得先尽力把它变成 pass/fail。
+       */
+      let verdict
+      let judgeError
+      let retried = false
+      try {
+        verdict = await runJudge(llm, route, judgePrompt(exchange.question, exchange.reply, live.criteria), live)
+      } catch (error) {
+        judgeError = error
+      }
+      if (verdict === undefined) {
+        retried = true
+        try {
+          verdict = await runJudge(llm, route, scorePrompt(exchange.question, exchange.reply, live.criteria), live)
+          judgeError = undefined
+        } catch (error) {
+          judgeError = error
+        }
+      }
+
+      const base = {
+        turn,
+        session: session.id,
+        rework: entry.reworks,
+        dryRun: live.dryRun,
+        route: `${route.provider}/${route.model}`,
+        chars: exchange.reply.length,
+        retried,
+      }
+
+      // ── UNKNOWN 出口 ────────────────────────────────────────────────
+      if (verdict === undefined) {
+        const reason = String((judgeError && judgeError.message) || judgeError)
+        const meta = judgeError?.judge ?? {}
+        const rework = live.onUnknown === 'rework'
+        audit({ ...base, decision: 'unknown', onUnknown: live.onUnknown, error: reason, ...meta }, live.auditFile)
+        if (!rework) {
+          try {
+            ctx.logger?.warn?.(
+              `${name}: judge gave no usable verdict, letting the turn close (onUnknown=pass, retried=${retried}): ${reason}`,
+            )
+          } catch {
+            // 吞掉。
+          }
+          return
+        }
+        if (live.dryRun) {
+          try {
+            ctx.logger?.warn?.(`${name}: [dry-run] would rework on unknown: ${reason}`)
+          } catch {
+            // 吞掉。
+          }
+          return
+        }
+        entry.reworks += 1
+        agent.steer({
+          id: `selfcheck-guard-${session.id}-${turn}-${entry.reworks}`,
+          role: 'user',
+          content: [{ type: 'text', text: noticeUnknown(entry.reworks, live.maxReworks) }],
+          source: GUARD_SOURCE,
+        })
+        return
+      }
+
+      // ── 拿到裁定：分数优先，verdict 兜底 ─────────────────────────────
+      // score 可能是 undefined（判官只说了 fail 没给数字）：那就按 verdict 判。
+      const failed =
+        verdict.verdict === 'fail' ||
+        (verdict.score !== undefined && verdict.score < live.scoreThreshold)
+      const decision = failed ? 'fail' : 'pass'
       audit(
         {
-          turn,
-          session: session.id,
+          ...base,
           score: verdict.score,
+          verdict: verdict.verdict,
+          decision,
+          scoreSource: verdict.scoreSource,
           failed,
           worst: verdict.worst,
           fix: verdict.fix,
-          rework: entry.reworks,
-          dryRun: live.dryRun,
-          route: `${route.provider}/${route.model}`,
-          chars: exchange.reply.length,
           finish: verdict.finish,
           judgeMs: verdict.judgeMs,
           textChars: verdict.textChars,
@@ -595,7 +814,7 @@ export function apply(ctx, config) {
     } catch (error) {
       // 一个质检器不该弄坏会话：放行，只留一行日志。
       const reason = String((error && error.message) || error)
-      audit({ turn, error: reason, ...(error?.judge ?? {}) }, live.auditFile)
+      audit({ turn, decision: 'unknown', error: reason, ...(error?.judge ?? {}) }, live.auditFile)
       try {
         ctx.logger?.warn?.(`${name}: check failed, letting the turn close: ${reason}`)
       } catch {
