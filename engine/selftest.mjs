@@ -5,6 +5,7 @@
  *   node selftest.mjs
  */
 
+import fs from 'node:fs'
 import { apply, name } from './index.mjs'
 
 let passed = 0
@@ -76,6 +77,40 @@ function fakeLlm(behaviour) {
     },
   }
 }
+
+/** 假 llm：完全自己给 chunk（用来演 reasoning 通道、aborted、max-tokens）。 */
+function fakeLlmChunks(chunks) {
+  const calls = []
+  return {
+    calls,
+    stream(options) {
+      calls.push(options)
+      return (async function* () {
+        for (const chunk of chunks) yield chunk
+      })()
+    },
+  }
+}
+
+/** 一段「话全在推理通道里」的流（v4 前会被当成判官空手）。 */
+const reasoningChunks = (text, reason = { kind: 'stop' }) => [
+  { type: 'block-start', index: 0, blockType: 'reasoning' },
+  { type: 'reasoning-delta', index: 0, text },
+  { type: 'block-end', index: 0, block: { type: 'reasoning', text } },
+  { type: 'finish', reason },
+]
+
+/** 读一行审计（JSONL 最后一行）。 */
+const lastAuditRow = (file) => {
+  const rows = fs
+    .readFileSync(file, 'utf8')
+    .trim()
+    .split('\n')
+    .filter((line) => line !== '')
+  return JSON.parse(rows[rows.length - 1])
+}
+
+const tmpFile = (suffix) => `${process.env.TEMP ?? '/tmp'}/selfcheck-${suffix}-${Date.now()}-${Math.random().toString(36).slice(2)}.jsonl`
 
 /** 造一个最小 ctx + agent，把 turn-stopping 的 handler 抓出来直接调。 */
 function harness(config, llm, events) {
@@ -268,7 +303,6 @@ console.log(`${name} selftest`)
 
 // 16. 判据来自外部 md 文件（用户自己写的那份）
 {
-  const fs = await import('node:fs')
   const path = `${process.env.TEMP ?? '/tmp'}/selfcheck-criteria-${Date.now()}.md`
   fs.writeFileSync(path, '1. 我是用户自己写的判据 MARKER-XYZ\n', 'utf8')
   const llm = fakeLlm(PASS_VERDICT)
@@ -287,6 +321,67 @@ console.log(`${name} selftest`)
   await h.stop()
   const prompt = llm.calls[0]?.messages?.[0]?.content?.[0]?.text ?? ''
   check('判据文件缺失则退回内置', prompt.includes('该带的出处一条不少'))
+}
+
+// 18. 文本全在 reasoning 通道（v4 的坑）→ 从推理里捞 JSON 照判
+{
+  const audit = tmpFile('audit-reason')
+  const h = harness(
+    { dryRun: false, auditFile: audit },
+    fakeLlmChunks(reasoningChunks(JSON.stringify(FAIL_VERDICT))),
+    baseEvents,
+  )
+  await h.stop()
+  check('reasoning 里的 JSON 也能判', h.steered.length === 1, `steered=${h.steered.length}`)
+  const row = lastAuditRow(audit)
+  check('审计记下 textSource=reasoning', row.textSource === 'reasoning', JSON.stringify(row))
+  check('审计记下 reasonChars', row.reasonChars > 0, JSON.stringify(row))
+  fs.unlinkSync(audit)
+}
+
+// 19. finish=aborted（超时 abort）→ 显式超时，不回炉，审计能看出原因
+{
+  const audit = tmpFile('audit-aborted')
+  const h = harness(
+    { dryRun: false, auditFile: audit },
+    fakeLlmChunks([{ type: 'finish', reason: { kind: 'aborted', failure: { code: 'ABORTED', message: 'aborted' } } }]),
+    baseEvents,
+  )
+  await h.stop()
+  check('aborted 不回炉', h.steered.length === 0, `steered=${h.steered.length}`)
+  const row = lastAuditRow(audit)
+  check('aborted 写进审计', row.finish === 'aborted', JSON.stringify(row))
+  check('aborted 审计带耗时', Number.isFinite(row.judgeMs), JSON.stringify(row))
+  check('aborted 报的是超时', String(row.error ?? '').includes('judge aborted after'), JSON.stringify(row))
+  fs.unlinkSync(audit)
+}
+
+// 20. finish=max-tokens 且一个字都没有 → 报「没产出文本」，不静默
+{
+  const audit = tmpFile('audit-maxtokens')
+  const h = harness(
+    { dryRun: false, auditFile: audit },
+    fakeLlmChunks([{ type: 'finish', reason: { kind: 'max-tokens' } }]),
+    baseEvents,
+  )
+  await h.stop()
+  check('maxTokens 吃光不回炉', h.steered.length === 0, `steered=${h.steered.length}`)
+  const row = lastAuditRow(audit)
+  check('maxTokens 写进审计', row.finish === 'max-tokens', JSON.stringify(row))
+  check('maxTokens 报的是没文本', String(row.error ?? '').includes('produced no text'), JSON.stringify(row))
+  fs.unlinkSync(audit)
+}
+
+// 21. 正常判分也带诊断字段（finish / judgeMs / textChars / reasonChars / textSource）
+{
+  const audit = tmpFile('audit-ok')
+  const h = harness({ dryRun: false, auditFile: audit }, fakeLlm(PASS_VERDICT), baseEvents)
+  await h.stop()
+  const row = lastAuditRow(audit)
+  check('正常判分记 finish=stop', row.finish === 'stop', JSON.stringify(row))
+  check('正常判分记 textSource=text', row.textSource === 'text', JSON.stringify(row))
+  check('正常判分记长度与耗时', row.textChars > 0 && Number.isFinite(row.judgeMs), JSON.stringify(row))
+  fs.unlinkSync(audit)
 }
 
 console.log(`\n${passed} passed, ${failed} failed`)

@@ -22,6 +22,13 @@
  *  - 同一 turn 最多回炉 maxReworks 次（默认 3，2026-10-31 用户指定），防死循环。
  *  - 判官调用失败/超时/拿不到模型 → **放行**（fail-open），绝不因为质检卡住会话。
  *  - `dryRun: true` 时只写日志不拦截。
+ *
+ * v4（2026-11-01）：判官「一个字都没吐」不再是谜。
+ *  原先审计里只剩一句 `judge returned no JSON: `，分不清是超时被 abort 还是 token 被推理吃光——
+ *  因为只收 `text-delta`，也只把 `kind === 'error'` 当错，而 SDK 把 abort 报成 `aborted`。
+ *  现在：也收 `reasoning-delta`（文本为空时从推理里捞 JSON）、`aborted` 当显式超时、
+ *  审计补 `finish`/`judgeMs`/`textChars`/`reasonChars`/`textSource`，
+ *  兜底默认提到 `timeoutMs 60000`、`maxTokens 4000`。
  */
 
 /** Cordis plugin name used by loader diagnostics. */
@@ -180,12 +187,49 @@ function parseVerdict(text) {
   }
 }
 
-/** 调一次判官，返回它的裁定。 */
+/** finish 原因折成审计里能读的一个词。 */
+function finishLabel(finish) {
+  if (finish === undefined || finish === null) return 'none'
+  return typeof finish.kind === 'string' && finish.kind !== '' ? finish.kind : 'unknown'
+}
+
+/**
+ * 文本为空时，从推理通道里捞一次 JSON（实测有模型把该说的话全放在 reasoning 里）。
+ * 返回 { text, source }，source ∈ 'text' | 'reasoning' | 'none'。
+ */
+function salvageText(text, reasoning) {
+  if (String(text).trim() !== '') return { text, source: 'text' }
+  const reason = String(reasoning ?? '')
+  if (reason.includes('{') && reason.includes('}')) return { text: reason, source: 'reasoning' }
+  return { text, source: 'none' }
+}
+
+/**
+ * 调一次判官，返回它的裁定（外加这次调用的诊断字段）。
+ *
+ * v4 起，失败不再只留一句 `judge returned no JSON: `：
+ *  - `finish.kind === 'aborted'`（超时 abort 走这条，SDK 不报 error）→ 抛显式超时错误；
+ *  - 文本空但推理里有 JSON → 捞出来照判；
+ *  - 抛出的错误挂 `error.judge`，调用方写进审计，好分清「超时」和「token 吃光」。
+ */
 async function runJudge(llm, route, question, reply, settings, criteria = CRITERIA) {
   const controller = new AbortController()
+  const started = Date.now()
   const timer = setTimeout(() => controller.abort(), settings.timeoutMs)
   let text = ''
+  let reasoning = ''
   let finish
+  const meta = () => ({
+    judgeMs: Date.now() - started,
+    finish: finishLabel(finish),
+    textChars: text.length,
+    reasonChars: reasoning.length,
+  })
+  const fail = (message) => {
+    const error = new Error(message)
+    error.judge = meta()
+    return error
+  }
   try {
     const stream = llm.stream({
       provider: route.provider,
@@ -197,15 +241,32 @@ async function runJudge(llm, route, question, reply, settings, criteria = CRITER
     })
     for await (const chunk of stream) {
       if (chunk?.type === 'text-delta' && typeof chunk.text === 'string') text += chunk.text
+      else if (chunk?.type === 'reasoning-delta' && typeof chunk.text === 'string') reasoning += chunk.text
       else if (chunk?.type === 'finish') finish = chunk.reason
     }
   } finally {
     clearTimeout(timer)
   }
-  if (finish !== undefined && finish?.kind === 'error') {
-    throw new Error(`judge stream failed: ${String(finish?.failure?.message ?? 'unknown')}`)
+  const info = meta()
+  if (info.finish === 'error') {
+    throw fail(`judge stream failed: ${String(finish?.failure?.message ?? 'unknown')} [${info.judgeMs}ms]`)
   }
-  return parseVerdict(text)
+  if (info.finish === 'aborted') {
+    throw fail(`judge aborted after ${info.judgeMs}ms (timeoutMs=${settings.timeoutMs})`)
+  }
+  const picked = salvageText(text, reasoning)
+  if (picked.text.trim() === '') {
+    throw fail(
+      `judge produced no text (finish=${info.finish}, ${info.judgeMs}ms, reasonChars=${info.reasonChars}, maxTokens=${settings.maxTokens})`,
+    )
+  }
+  try {
+    return { ...parseVerdict(picked.text), ...info, textSource: picked.source }
+  } catch (error) {
+    throw fail(
+      `${String((error && error.message) || error)} [finish=${info.finish}, ${info.judgeMs}ms, textChars=${info.textChars}, reasonChars=${info.reasonChars}]`,
+    )
+  }
 }
 
 /** 回炉时塞回去的那条消息。 */
@@ -247,8 +308,8 @@ export function apply(ctx, config) {
     enabled: bool('enabled', true),
     dryRun: bool('dryRun', true),
     maxReworks: int('maxReworks', 3, 0),
-    timeoutMs: int('timeoutMs', 20000, 1000),
-    maxTokens: int('maxTokens', 1500, 64),
+    timeoutMs: int('timeoutMs', 60000, 1000),
+    maxTokens: int('maxTokens', 4000, 64),
     minReplyChars: int('minReplyChars', 0, 0),
     scoreThreshold: int('scoreThreshold', 70, 0),
     auditFile: '',
@@ -503,6 +564,11 @@ export function apply(ctx, config) {
           dryRun: live.dryRun,
           route: `${route.provider}/${route.model}`,
           chars: exchange.reply.length,
+          finish: verdict.finish,
+          judgeMs: verdict.judgeMs,
+          textChars: verdict.textChars,
+          reasonChars: verdict.reasonChars,
+          textSource: verdict.textSource,
         },
         live.auditFile,
       )
@@ -529,7 +595,7 @@ export function apply(ctx, config) {
     } catch (error) {
       // 一个质检器不该弄坏会话：放行，只留一行日志。
       const reason = String((error && error.message) || error)
-      audit({ turn, error: reason }, live.auditFile)
+      audit({ turn, error: reason, ...(error?.judge ?? {}) }, live.auditFile)
       try {
         ctx.logger?.warn?.(`${name}: check failed, letting the turn close: ${reason}`)
       } catch {

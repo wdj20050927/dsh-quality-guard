@@ -74,8 +74,8 @@ sequenceDiagram
         auditFile: 'C:/Users/YOUR_NAME/.dsh/quality-guard/audit.jsonl'
         dryRun: true          # 先演习，只记日志不打回
         maxReworks: 3
-        timeoutMs: 20000
-        maxTokens: 1500
+        timeoutMs: 60000
+        maxTokens: 4000
 ```
 
 完整示例见 [`examples/cordis.patch.example.yml`](examples/cordis.patch.example.yml)。改完重启 dsh（或重载 patch）。
@@ -118,8 +118,8 @@ patch 里再追加一条按**包名**挂的：
 | `triggers.minReplyChars` | 回复短于这个字数就跳过检查 | 0–20000 | `0` | `0` |
 | `triggers.maxReworks` | 同一轮最多打回几次，防死循环 | 0–10 | `3` | `3` |
 | `triggers.scoreThreshold` | 判官打分的及格线 | 0–100 | `70` | `70` |
-| `judge.timeoutMs` | 判官超时就放弃，本条放行 | 1000–120000 | `20000` | `20000` |
-| `judge.maxTokens` | 判官最多能输出多少 token | 64–8000 | `1500` | `1500` |
+| `judge.timeoutMs` | 判官超时就放弃，本条放行 | 1000–120000 | `60000` | `60000` |
+| `judge.maxTokens` | 判官最多能输出多少 token | 64–8000 | `4000` | `4000` |
 | `judge.model` | 指定判官模型 `{provider, model}`；留空＝沿用当前会话的路由 | — | `null` | `null` |
 | `auditFile` | 审计日志落点；**空字符串＝不写** | — | — | `~/.dsh/quality-guard/audit.jsonl` |
 | `settingsFile` | 活设置文件落点 | — | — | — |
@@ -155,7 +155,9 @@ patch 里再追加一条按**包名**挂的：
 
 **一切失败都放行（fail-open）。** 判官超时、报错、拿不到 llm 服务、没有模型路由、`settings.json` 读坏——全部跳过检查继续会话。质检绝不该把会话卡住。
 
-**判官 `maxTokens` 别调回 800。** 判官要输出 JSON，800 会被截断，表现为日志里 `judge returned no JSON`，然后整条 fail-open 放行——看起来「没报错」，实际是压根没判。默认已提到 1500。
+**判官 `maxTokens` 别调回 800。** 判官要输出 JSON，800 会被截断，表现为日志里 `judge returned no JSON`，然后整条 fail-open 放行——看起来「没报错」，实际是压根没判。默认已提到 4000。
+
+**「一个字都没吐」现在查得出来了（v1.0.1）。** 引擎原先只收 `text-delta`，也只把 `finish.kind === 'error'` 当错；可超时 abort 在 SDK 里报的是 `aborted`，token 被推理吃光报的是 `max-tokens`——两种都静悄悄走到「空文本 → 放行」。现在：`aborted` 当显式超时、文本为空时从 `reasoning-delta` 里再捞一次 JSON、审计补上 `finish` / `judgeMs` / `textChars` / `reasonChars` / `textSource`。兜底默认同步提到 `timeoutMs 60000`、`maxTokens 4000`。
 
 **同一 turn 最多打回 `maxReworks` 次**，计数在内存里按 `session:turn` 分桶，进程重启清零。
 
@@ -168,7 +170,8 @@ patch 里再追加一条按**包名**挂的：
 ```json
 {"at":"…","turn":12,"session":"…","score":45,"failed":true,
  "worst":"只说『继续』，回复却甩出完整问题复盘…","fix":"先给结论，删掉没问的旁支…",
- "rework":0,"dryRun":false,"route":"…/…","chars":1180}
+ "rework":0,"dryRun":false,"route":"…/…","chars":1180,
+ "finish":"stop","judgeMs":4210,"textChars":96,"reasonChars":0,"textSource":"text"}
 ```
 
 `worst` / `fix` 是判官写的原话，等于把你的对话摘要留在了磁盘上。所以：
@@ -183,10 +186,10 @@ patch 里再追加一条按**包名**挂的：
 
 ```bash
 node engine/selftest.mjs
-# → 30 passed, 0 failed
+# → 43 passed, 0 failed
 ```
 
-用假 llm，不联网、不花钱，覆盖：判据拼装、超时/报错放行、`maxReworks` 上限、`dryRun`、外部判据文件、活动设置覆盖 patch 等。
+用假 llm，不联网、不花钱，覆盖：判据拼装、超时/报错放行、`maxReworks` 上限、`dryRun`、外部判据文件、活动设置覆盖 patch，以及 v1.0.1 的三种判官异常（JSON 全在 reasoning、`aborted`、`max-tokens` 空产出）与审计诊断字段。
 
 ---
 

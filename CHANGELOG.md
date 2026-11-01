@@ -1,5 +1,29 @@
 # 更新日志
 
+## v1.0.1 — 2026-11-01
+
+修掉「判官一个字都没吐，却被静默放行」这个坑：审计里原先只剩一句 `judge returned no JSON: `，分不清是超时被 abort 还是 token 被推理吃光。
+
+### 引擎 `engine/index.mjs`
+
+- **收 `reasoning-delta`**：文本通道为空时，从推理文本里捞一次 JSON 再判（有模型把该说的话全放在 reasoning 里）。
+- **`finish.kind === 'aborted'` 当显式超时**：超时 abort 在 SDK 里报的是 `aborted` 而不是 `error`，原先只认 `error`，于是被当成「空文本」静默 fail-open。现在抛 `judge aborted after <ms>ms (timeoutMs=…)`。
+- **空产出有话说**：文本与推理都空时报 `judge produced no text (finish=…, <ms>ms, reasonChars=…, maxTokens=…)`。
+- **审计补诊断字段**：`finish`（`stop` / `max-tokens` / `aborted` / `error` / `none`）、`judgeMs`、`textChars`、`reasonChars`、`textSource`（`text` / `reasoning`）；异常路径也带上这几个字段（挂在 error 上写进同一行）。
+- **兜底默认提高**：`timeoutMs 20000 → 60000`、`maxTokens 1500 → 4000`（面板上限仍是 120000 / 8000）。
+
+### 面板 `panel/`
+
+- 默认值同步为 `judge.timeoutMs 60000`、`judge.maxTokens 4000`。
+
+### 测试
+
+- `node engine/selftest.mjs` → **43 passed, 0 failed**（v1.0.0 是 30）：新增「JSON 全在 reasoning 通道也能判」「`aborted` 不回炉且审计记下 finish/耗时」「`max-tokens` 空产出报错」「正常判分记诊断字段」四组。
+
+### 已知限制
+
+- 判官仍是 fail-open：拿不到裁定（超时/空产出/报错）就放行，只是现在审计里能看清失败原因。
+
 ## v1.0.0 — 2026-11-01
 
 首个版本：发消息前质检（引擎 `selfcheck-guard` + 面板 `dsh-quality-guard`）。

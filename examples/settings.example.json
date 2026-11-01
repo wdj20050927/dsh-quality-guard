@@ -8,8 +8,8 @@
     "scoreThreshold": 70
   },
   "judge": {
-    "timeoutMs": 20000,
-    "maxTokens": 1500,
+    "timeoutMs": 60000,
+    "maxTokens": 4000,
     "model": null
   },
   "criteria": [

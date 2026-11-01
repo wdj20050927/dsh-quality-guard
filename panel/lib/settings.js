@@ -66,8 +66,9 @@ export function defaults() {
     enabled: true,
     dryRun: true,
     triggers: { minReplyChars: 0, maxReworks: 3, scoreThreshold: 70 },
-    // 800 会把判官的 JSON 截断（实测 7 条审计里 2 条 "judge returned no JSON"），提到 1500。
-    judge: { timeoutMs: 20000, maxTokens: 1500, model: null },
+    // 800 会把判官的 JSON 截断（实测 7 条审计里 2 条 "judge returned no JSON"），v1.0.1 起提到 4000。
+    // 超时同步提到 60s：20s 时有过「abort 后一个字都没吐」，而 abort 在 SDK 里不报 error，引擎看不出来。
+    judge: { timeoutMs: 60000, maxTokens: 4000, model: null },
     criteria: DEFAULT_CRITERIA.map((item) => ({ ...item })),
     exceptions: DEFAULT_EXCEPTIONS,
     auditFile: AUDIT_FILE.replace(/\\/g, '/'),
