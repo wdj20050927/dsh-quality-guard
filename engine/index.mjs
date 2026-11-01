@@ -305,8 +305,13 @@ function parseChecklist(text, items) {
  * 答不全（漏了编号）就抛错——那属于「判官没说清楚」，交给补判；
  * 但**已经答出来的部分能算分就先算分**，只要第 1 条有答案。
  * 这样即使被截断，也不会把已经判定的结论整条丢掉（v5 的老毛病）。
+ *
+ * **及格与否只看折算分数，不看「有没有哪条判了 no」。** 实测踩过：
+ * 判据表里「保持某某人设」这种风格项，技术回复永远不满足；
+ * 若按「任一条 no 即 fail」，一条 80 分的回复照样被打回，`scoreThreshold` 形同虚设。
+ * 现在第 1 条仍是硬门槛（判 no 时满分压到 59，必然低于及格线），其余按分数说话。
  */
-function checklistVerdict(text, items) {
+function checklistVerdict(text, items, threshold = 70) {
   const raw = String(text ?? '')
   const result = parseChecklist(raw, items)
   const first = result.hits[0]
@@ -320,7 +325,7 @@ function checklistVerdict(text, items) {
   const noes = items.filter((_item, index) => result.hits[index] === false).map((item) => item.id)
   return {
     score: result.score,
-    verdict: noes.length === 0 ? 'pass' : 'fail',
+    verdict: result.score < threshold ? 'fail' : 'pass',
     worst:
       noes.length === 0
         ? ''
@@ -924,7 +929,7 @@ export function apply(ctx, config) {
             route,
             checklistPrompt(exchange.question, exchange.reply, live.criteria, items),
             live,
-            (text) => checklistVerdict(text, items),
+            (text) => checklistVerdict(text, items, live.scoreThreshold),
             effortState,
           )
         } else {
@@ -942,7 +947,7 @@ export function apply(ctx, config) {
               route,
               checklistPrompt(exchange.question, exchange.reply, live.criteria, items, true),
               live,
-              (text) => checklistVerdict(text, items),
+              (text) => checklistVerdict(text, items, live.scoreThreshold),
               effortState,
             )
           } else {
