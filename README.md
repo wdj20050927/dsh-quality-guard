@@ -30,6 +30,29 @@
 
 ---
 
+## 一次检查是怎么走的
+
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant A as 助手
+    participant E as engine
+    participant J as 判官（第二次模型调用）
+    U->>A: 提问
+    A->>E: 轮次将结束（agent/turn-stopping）
+    E->>E: 读 settings.json（mtime:size 缓存 key）
+    E->>J: 判据 + 原问题 + 草稿
+    J-->>E: {verdict, score, worst, fix}
+    alt 不及格 且 reworks < maxReworks
+        E->>A: steer：按 fix 重写
+        A->>E: 轮次再次将结束
+    else 及格 / 到上限 / 任何异常
+        E-->>U: 放行
+    end
+```
+
+判官拿不到 llm、超时、报错、没有路由——全部走右边的放行分支（fail-open）。
+
 ## 安装
 
 ### 1. 引擎（必须）
@@ -172,6 +195,12 @@ node engine/selftest.mjs
 - 实测：DeepSeek Harness 桌面版 `0.2.1-rc.5`，Windows，Node `24.21.0`。
 - 只用了 Node 内置模块，引擎零依赖；面板依赖 `react ^18.2`。
 - macOS / Linux 路径分支未实测。
+
+---
+
+## 更新日志
+
+见 [CHANGELOG.md](CHANGELOG.md)。
 
 ---
 
