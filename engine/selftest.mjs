@@ -817,5 +817,39 @@ const checklistHarness = (llm, config = {}) => {
   fs.unlinkSync(criteriaFile)
 }
 
+// 48. v6.1：面板把 reasoningEffort 写在**顶层**，引擎必须认（曾经只读 judge.reasoningEffort，面板改了不生效）
+{
+  const settingsFile = `${process.env.TEMP ?? '/tmp'}/selfcheck-settings-${Date.now()}.json`
+  const audit = tmpFile('audit-live-effort')
+  fs.writeFileSync(
+    settingsFile,
+    JSON.stringify(
+      {
+        enabled: true,
+        dryRun: false,
+        triggers: { minReplyChars: 0, maxReworks: 3, scoreThreshold: 70 },
+        judge: { timeoutMs: 60000, maxTokens: 4000, model: null },
+        criteria: [
+          { id: 'a', enabled: true, text: '结论放在最前面' },
+          { id: 'b', enabled: true, text: '说人话' },
+        ],
+        reasoningEffort: 'minimal',
+        auditFile: audit,
+      },
+      null,
+      2,
+    ),
+    'utf8',
+  )
+  const llm = fakeLlm('1:yes 2:yes')
+  const h = harness({ dryRun: false, settingsFile, auditFile: audit }, llm, baseEvents)
+  await h.stop()
+  check('活设置顶层 reasoningEffort 生效', llm.calls[0]?.reasoningEffort === 'minimal', `effort=${llm.calls[0]?.reasoningEffort}`)
+  const row = lastAuditRow(audit)
+  check('活设置顶层 effort 记进审计', row.effort === 'minimal', `effort=${row.effort}`)
+  fs.unlinkSync(audit)
+  fs.unlinkSync(settingsFile)
+}
+
 console.log(`\n${passed} passed, ${failed} failed`)
 if (failed > 0) process.exitCode = 1

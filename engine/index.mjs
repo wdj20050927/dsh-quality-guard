@@ -856,11 +856,16 @@ export function apply(ctx, config) {
         timeoutMs: pickInt(judge.timeoutMs, settings.timeoutMs, 1000, 120000),
         maxTokens: pickInt(judge.maxTokens, settings.maxTokens, 64, 8000),
         onUnknown: parsed.onUnknown === 'rework' ? 'rework' : parsed.onUnknown === 'pass' ? 'pass' : settings.onUnknown,
-        reasoningEffort:
-          typeof judge.reasoningEffort === 'string' &&
-          ['off', 'minimal', 'low', 'medium', 'high'].includes(judge.reasoningEffort)
-            ? judge.reasoningEffort
-            : settings.reasoningEffort,
+        /**
+         * 面板把这一项写在**顶层** `reasoningEffort`（和 `onUnknown` 一样），
+         * 早期版本读的是 `judge.reasoningEffort`——两处都认，别让面板改了引擎看不见。
+         */
+        reasoningEffort: (() => {
+          const value = typeof parsed.reasoningEffort === 'string' ? parsed.reasoningEffort : judge.reasoningEffort
+          return typeof value === 'string' && ['off', 'minimal', 'low', 'medium', 'high'].includes(value)
+            ? value
+            : settings.reasoningEffort
+        })(),
         model: model ?? settings.model,
         auditFile: typeof parsed.auditFile === 'string' ? parsed.auditFile : settings.auditFile,
         criteria: Array.isArray(parsed.criteria)
