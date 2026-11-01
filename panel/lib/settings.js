@@ -72,6 +72,9 @@ export function defaults() {
     // 判官两次都拿不到裁定时的出口（v5 三值逻辑的 unknown）：
     // 'pass' ＝ 放行（旧行为，风险是漏判）；'rework' ＝ 打回重写（宁严不宽）。
     onUnknown: 'pass',
+    // 判官的思考档位（v6）。实测判官 91% 的输出字符花在推理上，4000 token 会被吃光。
+    // 'off' 在本机 relay 上会被上游 11133 拒（模型不接受该请求），所以默认用能用的最低档 'low'。
+    reasoningEffort: 'low',
     criteria: DEFAULT_CRITERIA.map((item) => ({ ...item })),
     exceptions: DEFAULT_EXCEPTIONS,
     auditFile: AUDIT_FILE.replace(/\\/g, '/'),
@@ -87,6 +90,7 @@ export const FIELD_HELP = {
   maxReworks: '同一条回复最多被打回几次，防死循环。0＝永不回炉。',
   scoreThreshold: '判官打分的及格线（0-100）。低于它就算不过。',
   onUnknown: '判官两次都拿不到裁定（超时、断流、空输出）时怎么办。放行＝旧行为，风险是漏判；打回＝宁严不宽，会多花一轮。',
+  reasoningEffort: '判官思考多深。档位越高，推理越占 token、越容易把答案挤没。实测「关」会被上游拒绝，所以最低只到「少」。',
   timeoutMs: '判官超过这么久没回话就放弃，本条放行。',
   maxTokens: '判官最多能输出多少 token。',
   criteria: '判官手里那张尺子。勾掉＝这一条不再检查。',
@@ -95,6 +99,9 @@ export const FIELD_HELP = {
 
 const MAX_TEXT = 2000
 const MAX_EXCEPTIONS = 4000
+
+/** 引擎认的思考档位（与 selfcheck-guard/index.mjs 的 ALLOWED_EFFORTS 保持一致）。 */
+const EFFORTS = ['off', 'minimal', 'low', 'medium', 'high']
 
 function fail(message) {
   const error = new Error(message)
@@ -184,6 +191,7 @@ export function normalize(input) {
     criteria,
     exceptions: exceptions.trim(),
     onUnknown: input.onUnknown === 'rework' ? 'rework' : input.onUnknown === 'pass' ? 'pass' : base.onUnknown,
+    reasoningEffort: EFFORTS.includes(input.reasoningEffort) ? input.reasoningEffort : base.reasoningEffort,
     auditFile: auditFile.replace(/\\/g, '/'),
     updatedAt: typeof input.updatedAt === 'string' ? input.updatedAt : null,
   }

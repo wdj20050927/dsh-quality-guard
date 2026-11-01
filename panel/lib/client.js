@@ -27,7 +27,10 @@ window.__ModuleLoader__.load({
     /** 侧边栏行序：插件 0、自动化任务 10、看板 20、技能中心 30、ThoughtDAG 30 → 质检排 40。 */
     const PANEL_ORDER = 40
     const API_ROOT = '/quality-guard/api'
-
+    /** 引擎认的思考档位（与 selfcheck-guard/index.mjs 的 ALLOWED_EFFORTS 一致）。 */
+    const EFFORTS = ['off', 'minimal', 'low', 'medium', 'high']
+    /** 档位的中文名：面板上不出现英文，免得像没翻译完。 */
+    const EFFORT_LABELS = { off: '关', minimal: '最少', low: '少', medium: '中', high: '多' }
     /** 自带样式用「有主」的 <style>，重复加载时复用上一次的 sheet。 */
     const CSS_ID = `${NS}/client.css`
     const CSS = `
@@ -286,6 +289,7 @@ window.__ModuleLoader__.load({
         criteria: settings.criteria.map((item) => ({ ...item })),
         exceptions: settings.exceptions,
         onUnknown: settings.onUnknown === 'rework' ? 'rework' : 'pass',
+        reasoningEffort: EFFORTS.includes(settings.reasoningEffort) ? settings.reasoningEffort : 'low',
       }
     }
 
@@ -323,6 +327,7 @@ window.__ModuleLoader__.load({
         criteria,
         exceptions: draft.exceptions,
         onUnknown: draft.onUnknown === 'rework' ? 'rework' : 'pass',
+        reasoningEffort: EFFORTS.includes(draft.reasoningEffort) ? draft.reasoningEffort : 'low',
       }
     }
 
@@ -333,6 +338,7 @@ window.__ModuleLoader__.load({
       maxReworks: '同一条回复最多被打回几次，防死循环。0＝永不回炉。',
       scoreThreshold: '判官打分（0-100）低于这条线就算不过。',
       onUnknown: '判官两次都拿不到裁定（超时、断流、空输出）时怎么办。放行＝旧行为，风险是漏判；打回＝宁严不宽，会多花一轮。',
+      reasoningEffort: '判官思考多深。档位越高，推理越占 token、越容易把答案挤没。实测「关」会被上游拒绝，所以最低只到「少」。',
       timeoutMs: '判官超过这么久没回话就放弃，本条放行。',
       maxTokens: '判官最多能输出多少 token。',
     }
@@ -755,6 +761,13 @@ window.__ModuleLoader__.load({
               max: 8000,
               unit: 'tok',
               onChange: (value) => patchDraft((next) => { next.judge.maxTokens = value }),
+            }),
+            h(ChoiceRow, {
+              title: '判官思考多深',
+              help: HELP.reasoningEffort,
+              value: draft.reasoningEffort,
+              options: EFFORTS.map((effort) => ({ value: effort, label: EFFORT_LABELS[effort] })),
+              onChange: (value) => patchDraft((next) => { next.reasoningEffort = value }),
             }),
             h(ChoiceRow, {
               title: '判官拿不到裁定时',

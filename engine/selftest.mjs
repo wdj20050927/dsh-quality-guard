@@ -146,7 +146,7 @@ function harness(config, llm, events) {
   const stop = async (turn = 1) => {
     for (const handler of handlers['agent/turn-stopping'] ?? []) await handler({ agent, turn })
   }
-  return { stop, steered, warned }
+  return { stop, steered, warned, llm }
 }
 
 const FAIL_VERDICT = { score: 35, verdict: 'fail', worst: '先铺了三段背景', fix: '第一句直接给结论' }
@@ -234,7 +234,7 @@ console.log(`${name} selftest`)
   await h.stop()
   check('非法输出则放行', h.steered.length === 0)
   check('非法输出会补判一次', llm.calls.length === 2, `calls=${llm.calls.length}`)
-  check('补判的提示只要一行 SCORE', String(llm.calls[1]?.messages?.[0]?.content?.[0]?.text ?? '').includes('SCORE: 0-100'))
+  check('补判的提示是更短的清单版', String(llm.calls[1]?.messages?.[0]?.content?.[0]?.text ?? '').includes('只输出这一行判定结果'))
 }
 
 // 9. 没有路由 → 不调用，只 warn 一次
@@ -572,6 +572,249 @@ console.log(`${name} selftest`)
   await h.stop()
   check('只说 pass 没分数不算数', h.steered.length === 0, `steered=${h.steered.length}`)
   check('只说 pass 会触发补判', h.warned.some((line) => line.includes('onUnknown=pass')), h.warned.join(' | '))
+}
+
+/**
+ * v6：清单模式。
+ *
+ * 背景（实测，见 `.scratch/probe-judge-*.mjs`）：让判官给「0-100 一个整数」，
+ * 同一段回复连判 9 次得 40/1/2/20/20/20/30/25/55（range 54），还会自作主张换成 `SCORE: 2/10`。
+ * 改成逐条 yes/no 后同一批用例 range 0~11。这一组守的就是「别再退回打分模式」。
+ */
+const CHECKLIST_CRITERIA = [
+  '判据（任一条不满足即不合格）：',
+  '1. 最核心的那一条放在最前面直接给出。',
+  '2. 用最简单最直白的话说。',
+  '3. 不旁生枝节。',
+].join('\n')
+
+/** 写一份只有 3 条编号判据的临时文件（清单模式要靠编号才启用）。 */
+const checklistCriteriaFile = () => {
+  const file = `${process.env.TEMP ?? '/tmp'}/selfcheck-criteria-${Date.now()}-${Math.random().toString(36).slice(2)}.md`
+  fs.writeFileSync(file, CHECKLIST_CRITERIA, 'utf8')
+  return file
+}
+
+const checklistHarness = (llm, config = {}) => {
+  const criteriaFile = checklistCriteriaFile()
+  const h = harness({ dryRun: false, criteriaFile, ...config }, llm, baseEvents)
+  h.cleanup = () => fs.rmSync(criteriaFile, { force: true })
+  return h
+}
+
+// 33. 清单模式：全 yes → 100 分 pass，且走的是 checklist 分支
+{
+  const audit = tmpFile('audit-cl-all')
+  const h = checklistHarness(fakeLlm('1:yes 2:yes 3:yes\nFIX: 无需改动'), { auditFile: audit })
+  await h.stop()
+  const row = lastAuditRow(audit)
+  check('清单全 yes 记 100 分', row.score === 100, JSON.stringify(row))
+  check('清单全 yes 判 pass', row.decision === 'pass', JSON.stringify(row))
+  check('清单模式 scoreSource=checklist', row.scoreSource === 'checklist', JSON.stringify(row))
+  check('清单模式不回炉', h.steered.length === 0, `steered=${h.steered.length}`)
+  h.cleanup()
+  fs.unlinkSync(audit)
+}
+
+// 34. 清单模式：第 1 条 no 是硬门槛，满分只按 59 折算
+{
+  const audit = tmpFile('audit-cl-gate')
+  const h = checklistHarness(fakeLlm('1:no 2:yes 3:yes\nFIX: 开头直接给结论'), { auditFile: audit })
+  await h.stop()
+  const row = lastAuditRow(audit)
+  check('第 1 条不过则分数按 59 折算', row.score === 39, `score=${row.score}`)
+  check('第 1 条不过就判 fail', row.decision === 'fail', JSON.stringify(row))
+  check('第 1 条不过真回炉', h.steered.length === 1, `steered=${h.steered.length}`)
+  check('回炉文案点名是哪一条', String(h.steered[0]?.content?.[0]?.text ?? '').includes('最核心的那一条'), String(h.steered[0]?.content?.[0]?.text ?? ''))
+  h.cleanup()
+  fs.unlinkSync(audit)
+}
+
+// 35. 清单模式：第 2、3 条 no → 33 分 fail
+{
+  const audit = tmpFile('audit-cl-partial')
+  const h = checklistHarness(fakeLlm('1:yes 2:no 3:no\nFIX: 说人话'), { auditFile: audit })
+  await h.stop()
+  const row = lastAuditRow(audit)
+  check('清单部分不过按比例折算', row.score === 33, `score=${row.score}`)
+  check('清单部分不过判 fail', row.decision === 'fail', JSON.stringify(row))
+  h.cleanup()
+  fs.unlinkSync(audit)
+}
+
+// 36. 清单模式：答漏编号时，已答出来的部分照样算分（只要第 1 条在）
+{
+  const audit = tmpFile('audit-cl-missing')
+  const h = checklistHarness(fakeLlm('1:yes 2:yes'), { auditFile: audit })
+  await h.stop()
+  const row = lastAuditRow(audit)
+  check('答漏编号仍按已答部分算分', row.score === 67, `score=${row.score}`)
+  check('答漏编号会记下漏了哪几条', Array.isArray(row.incomplete) && row.incomplete.includes(3), JSON.stringify(row.incomplete))
+  h.cleanup()
+  fs.unlinkSync(audit)
+}
+
+// 37. 清单模式：判官改口吐老格式 JSON，也认（要的是裁定，不是格式）
+{
+  const audit = tmpFile('audit-cl-json')
+  const h = harness({ dryRun: false, auditFile: audit }, fakeLlm({ score: 88, verdict: 'pass' }), baseEvents)
+  await h.stop()
+  const row = lastAuditRow(audit)
+  check('清单模式里老 JSON 也认', row.score === 88, JSON.stringify(row))
+  check('清单模式里老 JSON 记 scoreSource=json', row.scoreSource === 'json', JSON.stringify(row))
+  fs.unlinkSync(audit)
+}
+
+// 38. 清单模式：判官只吐老格式 `SCORE: 30` 也认
+{
+  const audit = tmpFile('audit-cl-score')
+  const h = harness({ dryRun: false, auditFile: audit }, fakeLlm('SCORE: 30'), baseEvents)
+  await h.stop()
+  const row = lastAuditRow(audit)
+  check('清单模式里 SCORE 行也认', row.score === 30, JSON.stringify(row))
+  check('清单模式里 SCORE 行判 fail', row.decision === 'fail', JSON.stringify(row))
+  fs.unlinkSync(audit)
+}
+
+// 39. 清单模式：提示里必须把编号列出来，且要求一条不漏
+{
+  const llm = fakeLlm('1:yes 2:yes 3:yes')
+  const h = harness({ dryRun: false }, llm, baseEvents)
+  await h.stop()
+  const prompt = String(llm.calls[0]?.messages?.[0]?.content?.[0]?.text ?? '')
+  check('清单提示带全部编号', prompt.includes('1:yes') && prompt.includes('3:yes'), prompt.slice(0, 200))
+  check('清单提示要求一条不漏', prompt.includes('一条都不许漏'))
+  check('清单提示把判定放第一行', prompt.includes('第一行必须是全部判定结果'))
+}
+
+// 40. v6：判官必须显式传 reasoningEffort（不传就继承 profile 的 high，token 全被推理吃掉）
+{
+  const llm = fakeLlm('1:yes 2:yes 3:yes')
+  const h = harness({ dryRun: false }, llm, baseEvents)
+  await h.stop()
+  check('判官显式传 reasoningEffort', llm.calls[0]?.reasoningEffort === 'low', `effort=${llm.calls[0]?.reasoningEffort}`)
+}
+
+// 41. v6：reasoningEffort 可配，配成 high 就传 high
+{
+  const llm = fakeLlm('1:yes 2:yes 3:yes')
+  const h = harness({ dryRun: false, reasoningEffort: 'high' }, llm, baseEvents)
+  await h.stop()
+  check('reasoningEffort 可配成 high', llm.calls[0]?.reasoningEffort === 'high', `effort=${llm.calls[0]?.reasoningEffort}`)
+}
+
+// 42. v6：非法 reasoningEffort 当场报错
+{
+  let threw
+  try {
+    harness({ reasoningEffort: 'turbo' }, fakeLlm('1:yes'), baseEvents)
+  } catch (error) {
+    threw = error
+  }
+  check('非法 reasoningEffort 报错', threw instanceof TypeError && String(threw.message).includes('reasoningEffort'), String(threw))
+}
+
+// 43. v6：宿主说「不支持这个档位」→ 自动退回不传，绝不让它变成「不查」
+{
+  let attempt = 0
+  const llm = {
+    calls: [],
+    stream(options) {
+      this.calls.push(options)
+      attempt += 1
+      if (attempt === 1) {
+        return (async function* () {
+          throw new Error('pi-ai provider "workbuddy" model "x" does not support reasoning effort "low"')
+        })()
+      }
+      const text = '1:yes 2:yes 3:yes'
+      return (async function* () {
+        for (let i = 0; i < text.length; i += 40) yield { type: 'text-delta', text: text.slice(i, i + 40) }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      })()
+    },
+  }
+  const audit = tmpFile('audit-effort-fallback')
+  const h = checklistHarness(llm, { auditFile: audit })
+  await h.stop()
+  check('档位被拒后重试一次', llm.calls.length === 2, `calls=${llm.calls.length}`)
+  check('档位被拒后第二次不传 effort', llm.calls[1]?.reasoningEffort === undefined, `effort=${llm.calls[1]?.reasoningEffort}`)
+  const row = lastAuditRow(audit)
+  check('档位被拒后仍正常判分', row.decision === 'pass' && row.score === 100, JSON.stringify(row))
+  h.cleanup()
+  fs.unlinkSync(audit)
+}
+
+// 44. v6：上游 11133（模型不接受当前请求）也算档位不支持，要退回
+{
+  let attempt = 0
+  const llm = {
+    calls: [],
+    stream(options) {
+      this.calls.push(options)
+      attempt += 1
+      if (attempt === 1) {
+        return (async function* () {
+          throw new Error('上游 11133：模型不接受当前请求')
+        })()
+      }
+      const text = '1:yes 2:yes 3:yes'
+      return (async function* () {
+        for (let i = 0; i < text.length; i += 40) yield { type: 'text-delta', text: text.slice(i, i + 40) }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      })()
+    },
+  }
+  const h = harness({ dryRun: false }, llm, baseEvents)
+  await h.stop()
+  check('上游 11133 也触发退回', llm.calls.length === 2, `calls=${llm.calls.length}`)
+  check('上游 11133 退回后不传 effort', llm.calls[1]?.reasoningEffort === undefined, `effort=${llm.calls[1]?.reasoningEffort}`)
+}
+
+// 45. v6：真错误（不是档位问题）不许被当成「档位不支持」而丢掉 effort
+{
+  const llm = fakeLlm(new Error('upstream 502 bad gateway'))
+  const audit = tmpFile('audit-effort-real-error')
+  const h = harness({ dryRun: false, auditFile: audit }, llm, baseEvents)
+  await h.stop()
+  // 两次调用＝一次主判 + 一次补判；关键是两次都还带着 effort，没被误判成「档位不支持」。
+  check('真错误两次调用都保留 effort', llm.calls.every((call) => call.reasoningEffort === 'low'), llm.calls.map((call) => call.reasoningEffort).join(','))
+  const row = lastAuditRow(audit)
+  check('真错误走 unknown 出口', row.decision === 'unknown', JSON.stringify(row))
+  fs.unlinkSync(audit)
+}
+// 46. v6：截断也要能判——判定在第一行，尾巴掉了不影响
+{
+  const audit = tmpFile('audit-cl-trunc')
+  const chunks = [
+    { type: 'text-delta', text: '1:no 2:yes 3:yes\nFIX: 开头直接给结' },
+    { type: 'finish', reason: { kind: 'max-tokens' } },
+  ]
+  const h = checklistHarness(fakeLlmChunks(chunks), { auditFile: audit })
+  await h.stop()
+  const row = lastAuditRow(audit)
+  check('截断的清单仍能判分', row.score === 39, JSON.stringify(row))
+  check('截断的清单仍判 fail', row.decision === 'fail', JSON.stringify(row))
+  check('截断的清单不记 error', row.error === undefined, JSON.stringify(row.error))
+  h.cleanup()
+  fs.unlinkSync(audit)
+}
+
+// 47. v6：判据里没有编号条目 → 退回老的 SCORE 问法
+{
+  const criteriaFile = `${process.env.TEMP ?? '/tmp'}/selfcheck-criteria-${Date.now()}.md`
+  fs.writeFileSync(criteriaFile, '判据：结论前置，别铺垫。\n', 'utf8')
+  const audit = tmpFile('audit-no-checklist')
+  const llm = fakeLlm('SCORE: 40\nVERDICT: fail\nWORST: 铺垫太长\nFIX: 结论前置')
+  const h = harness({ dryRun: false, auditFile: audit, criteriaFile }, llm, baseEvents)
+  await h.stop()
+  const prompt = String(llm.calls[0]?.messages?.[0]?.content?.[0]?.text ?? '')
+  check('无编号判据时退回 SCORE 问法', prompt.includes('SCORE: 0-100'), prompt.slice(-200))
+  const row = lastAuditRow(audit)
+  check('无编号判据时仍能判分', row.score === 40, JSON.stringify(row))
+  check('无编号判据时 scoreSource=lines', row.scoreSource === 'lines', JSON.stringify(row))
+  fs.unlinkSync(audit)
+  fs.unlinkSync(criteriaFile)
 }
 
 console.log(`\n${passed} passed, ${failed} failed`)

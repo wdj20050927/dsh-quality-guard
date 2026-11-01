@@ -41,6 +41,19 @@
  *     仍拿不到就按 `onUnknown` 处置（默认 `pass`，可设 `rework`）。unknown 一律写进审计，可回查。
  *  出处：anthropics/claude-cookbooks `capabilities/content_moderation/engine.py` 的
  *  「Any unknown that would matter yields decision `needs_review` rather than a confident verdict」。
+ *
+ * v6（2026-11-01）：v5 只治了「拿不到裁定」，没治**量具本身**。直连上游实测（见 `.scratch/probe-judge-*.mjs`）：
+ *  1. **推理吃光 token**：39 行带诊断的审计里，判官输出中推理字符占比 avg 91%、min 78%、max 97.7%，
+ *     而真正答案平均只有 210 字符。`maxTokens 4000` 全被思考吃掉，答案只剩尾巴——这才是 `no JSON` 的根。
+ *     病根是判官没传 `reasoningEffort`，继承了 profile 的 `high`。
+ *     实测同一提示：`high` 推理 944~1144 字符，`low` 只要 252 字符。改成默认 `low`，宿主拒绝时自动退回不传。
+ *  2. **「0-100 一个整数」是坏量具**：同一段回复、同一提示连判 9 次，得到
+ *     40 / 1 / 2 / 20 / 20 / 20 / 30 / 25 / 55（range 54），`temperature: 0` 也压不住。
+ *     更糟的是模型会自作主张换尺度，吐出 `SCORE: 2/10`、`SCORE: 1/4`——被当成 2 分、1 分。
+ *  3. 换成**逐条判据 yes/no**（让模型只做它擅长的二选一，分数由程序算）后，同一批用例：
+ *     good 100/100、mid 80/80/80、bad 24/35/35，方差从 54 降到 0~11，且好坏分得开。
+ *  ⇒ v6 的判官默认走**清单模式**：判据逐条 yes/no，程序折算分数；第 1 条（结论前置）是硬门槛。
+ *    判据里没有编号条目时才退回「SCORE: 0-100」的老问法。
  */
 
 /** Cordis plugin name used by loader diagnostics. */
@@ -61,6 +74,7 @@ const ALLOWED_KEYS = new Set([
   'minReplyChars',
   'scoreThreshold',
   'onUnknown',
+  'reasoningEffort',
   'auditFile',
   'criteriaFile',
   'settingsFile',
@@ -70,11 +84,20 @@ const ALLOWED_KEYS = new Set([
 /** 本插件注入消息的 source.kind，用于自我识别（不会被当成用户说的话）。 */
 const GUARD_SOURCE = { kind: 'plugin:selfcheck-guard' }
 
-/** 判官的系统提示：只判表达与命中，不判内容对错。 */
+/**
+ * 判官的系统提示：只判表达与命中，不判内容对错。
+ *
+ * v6 校准（`.scratch/probe-v6-calib2.mjs`，同一批语料各判 3 次）：
+ * 「宁可判不合格」这句会把它推向过度严格——好回复 80/80/100，中性版 100/100/80，
+ * 而两类坏回复在两版下都是 47/47/47 与 35/35/35，**严格度没换来任何区分度**。
+ * 所以把「宁可判不合格」换成「判据没写的不算违规」：
+ * 判据本身就是用户的原话，判官只负责核对，不该自己加戏。
+ */
 const JUDGE_SYSTEM = [
-  '你是一个苛刻的质检员。你面前有「用户的问题」和「助手即将发出的回复」。',
-  '你不评价内容是否正确、是否充分，只判定这段回复**读起来是否符合用户的阅读要求**。',
-  '宁可判不合格，也不要放过一整段铺垫、背景、旁支。',
+  '你是一个质检员。你面前有「用户的问题」和「助手即将发出的回复」。',
+  '你不评价内容是否正确、是否充分，只判定这段回复**读起来是否符合用户给出的判据**。',
+  '判据没写的要求不算违规；判据的前提在本轮不成立时（比如回复里没出现数值、用户只问了一个问题），该条算满足。',
+  '判不合格必须能指出回复里具体是哪句话违反了哪条判据；指不出具体句子就判合格。',
 ].join('\n')
 
 /** 判据：直接抄用户的原话，不加解释。 */
@@ -190,6 +213,129 @@ function judgePrompt(question, reply, criteria = CRITERIA) {
     'WORST: 最严重的那一条问题，一句话',
     'FIX: 具体怎么改，一句话，可执行',
   ].join('\n')
+}
+
+/**
+ * 从判据正文里抠出编号条目（`1. xxx` / `1、xxx` / `1) xxx`）。
+ *
+ * 清单模式靠这些编号让判官逐条 yes/no——判据是用户自己编辑的 md，
+ * 条目名字可能很长、可能带括号解释，让模型复述名字容易走样，**编号不会**。
+ * 少于 2 条就当没有清单（单条判据折算分数没意义，退回老的 SCORE 问法）。
+ */
+function checklistItems(criteria) {
+  const text = String(criteria ?? '')
+  const items = []
+  const pattern = /^[ \t]*(\d{1,2})[.、)][ \t]*(\S.*)$/gm
+  let match
+  while ((match = pattern.exec(text)) !== null) {
+    items.push({ id: Number(match[1]), text: match[2].trim() })
+  }
+  return items.length >= 2 ? items : []
+}
+
+/**
+ * 清单模式的提示：让判官逐条判 yes/no，**判定压在一行里放在最前面**。
+ *
+ * 为什么不用「给个 0-100 的分数」：直连上游实测同一段回复连判 9 次得
+ * 40/1/2/20/20/20/30/25/55（range 54），模型还会自作主张换成 `SCORE: 2/10`。
+ * 换成逐条 yes/no 后同一批用例 range 降到 0~11，且 good 100 / mid 80 / bad 24~35 分得开。
+ * 判定放第一行是 v5「分数第一行」那招的复用：截断只吃尾巴。
+ */
+function checklistPrompt(question, reply, criteria, items, brief = false) {
+  const clip = (text, limit) => (text.length <= limit ? text : `${text.slice(0, limit)}\n……（后略 ${text.length - limit} 字）`)
+  const sample = items.map((item) => `${item.id}:yes`).join(' ')
+  return [
+    '【用户的问题】',
+    question === undefined ? '（这一轮没有找到用户的原话，只判定表达是否直白、是否旁生枝节；第 1、5 条按不适用处理）' : clip(question, brief ? 600 : 1500),
+    '',
+    '【助手即将发出的回复】',
+    clip(reply, brief ? 2000 : 5000),
+    '',
+    criteria,
+    '',
+    '请逐条判定上面每一条判据是否满足（yes = 满足，no = 不满足）。判定规则：',
+    '- 判 yes：这条判据的要求已经做到。',
+    '- 判 no：必须能在上面那段回复里指出**具体是哪句话**违反了它。指不出具体句子，就判 yes。',
+    '- 判据的前提在本轮不成立时（比如没出现数值、用户只问了一个问题），该条判 yes，不要判 no。',
+    '- 不要因为「可以写得更好」而判 no，只因为「确实违反了」才判 no。',
+    '',
+    '然后严格按下面的格式输出。',
+    `第一行必须是全部判定结果，格式为「编号:yes/no」，用空格隔开，一条都不许漏，例如：${sample}`,
+    brief
+      ? '只输出这一行判定结果，不要 FIX、不要解释。'
+      : '第二行必须是 FIX: 具体怎么改，一句话，可执行',
+    '不要任何其他文字、不要 JSON、不要代码块围栏、不要解释。',
+  ].join('\n')
+}
+
+/** 清单模式解析：`1:yes 2:no …`（容忍 `1. yes` / `1：yes` / 逗号分隔）。 */
+function parseChecklist(text, items) {
+  const raw = String(text ?? '')
+  const hits = items.map((item) => {
+    const pattern = new RegExp(`(?:^|[\\s,，;；])${item.id}\\s*[:：.、)]?\\s*(yes|no|是|否)\\b`, 'i')
+    const match = pattern.exec(raw)
+    if (match === null) return undefined
+    const value = match[1].toLowerCase()
+    return value === 'yes' || value === '是'
+  })
+  const missing = items.filter((_item, index) => hits[index] === undefined)
+  const passed = hits.filter((hit) => hit === true).length
+  const fix = /^[ \t>*\-]*FIX[ \t]*[:：][ \t]*(.+)$/im.exec(raw)
+  return {
+    hits,
+    missing: missing.map((item) => item.id),
+    passed,
+    total: items.length,
+    fix: fix === null ? '' : fix[1].trim(),
+    /**
+     * 第 1 条（结论前置）是硬门槛：它不过，满分也只按 59 折算。
+     * 依据是用户自己写的第一条判据——「最核心的那一点放最前面，不许先铺垫」，
+     * 一条铺垫开头的回复不管其他条多好，都不是他要的。
+     */
+    score: hits[0] === false
+      ? Math.round((passed / items.length) * 59)
+      : Math.round((passed / items.length) * 100),
+    complete: missing.length === 0,
+  }
+}
+
+/**
+ * 清单模式的裁定器：把 `1:yes 2:no …` 折成和 `parseVerdict` 同形的结果。
+ *
+ * 答不全（漏了编号）就抛错——那属于「判官没说清楚」，交给补判；
+ * 但**已经答出来的部分能算分就先算分**，只要第 1 条有答案。
+ * 这样即使被截断，也不会把已经判定的结论整条丢掉（v5 的老毛病）。
+ */
+function checklistVerdict(text, items) {
+  const raw = String(text ?? '')
+  const result = parseChecklist(raw, items)
+  const first = result.hits[0]
+  if (first === undefined) {
+    /**
+     * 判官没按清单答——但可能按老格式答了（`SCORE: 62` / 完整 JSON / 半截 JSON）。
+     * 那照样算数：要的是裁定，不是格式。**先走三层抢救，抢救不到才抛。**
+     */
+    return parseVerdict(raw)
+  }
+  const noes = items.filter((_item, index) => result.hits[index] === false).map((item) => item.id)
+  return {
+    score: result.score,
+    verdict: noes.length === 0 ? 'pass' : 'fail',
+    worst:
+      noes.length === 0
+        ? ''
+        : `第 ${noes.join('、')} 条没满足：${noes
+            .map((id) => {
+              const item = items.find((entry) => entry.id === id)
+              return item === undefined ? '' : item.text
+            })
+            .filter((line) => line !== '')
+            .join('；')}`,
+    fix: result.fix,
+    scoreSource: 'checklist',
+    checks: result.hits.map((hit, index) => ({ id: items[index].id, ok: hit })),
+    incomplete: result.complete ? undefined : result.missing,
+  }
 }
 
 /** 行式输出：`SCORE: 62`（容忍 markdown 的 `-`/`*`/`>` 前缀与全角冒号）。 */
@@ -310,8 +456,13 @@ function salvageText(text, reasoning) {
  * v5 起**先解析、再判失败**：`finish === 'error'` / `'aborted'` 也可能是「分数已经吐出来了才断的」，
  * 旧版先抛错就把已经写出来的分数丢了（实测 11 条漏判全是这么来的）。
  * 顺序：解析 → 有分数就返回 → 没分数才按 finish 抛显式原因。
+ *
+ * v6 起两件事：
+ *  1. 传 `reasoningEffort`（默认 `low`）。判官继承 profile 的 `high` 时，实测 91% 的 token 花在思考上，
+ *     答案只剩两百来字符——这才是 `no JSON` 的真正成因。宿主/上游拒绝该档位时自动退回不传。
+ *  2. `parse` 由调用方给：清单模式传 `checklistVerdict`，老问法传 `parseVerdict`。
  */
-async function runJudge(llm, route, promptText, settings) {
+async function runJudge(llm, route, promptText, settings, parse = parseVerdict, effortState = {}) {
   const controller = new AbortController()
   const started = Date.now()
   const timer = setTimeout(() => controller.abort(), settings.timeoutMs)
@@ -323,25 +474,64 @@ async function runJudge(llm, route, promptText, settings) {
     finish: finishLabel(finish),
     textChars: text.length,
     reasonChars: reasoning.length,
+    effort: effortUsed ?? 'default',
   })
   const fail = (message) => {
     const error = new Error(message)
     error.judge = meta()
     return error
   }
-  try {
-    const stream = llm.stream({
+  const reset = () => {
+    text = ''
+    reasoning = ''
+    finish = undefined
+  }
+  const collect = async (effort) => {
+    const options = {
       provider: route.provider,
       model: route.model,
       system: JUDGE_SYSTEM,
       messages: [{ role: 'user', content: [{ type: 'text', text: promptText }] }],
       maxTokens: settings.maxTokens,
       signal: controller.signal,
-    })
+    }
+    // 不传 = 继承 profile 的推理档位（本机是 high），那是 token 被吃光的原因。
+    if (effort !== undefined) options.reasoningEffort = effort
+    const stream = llm.stream(options)
     for await (const chunk of stream) {
       if (chunk?.type === 'text-delta' && typeof chunk.text === 'string') text += chunk.text
       else if (chunk?.type === 'reasoning-delta' && typeof chunk.text === 'string') reasoning += chunk.text
       else if (chunk?.type === 'finish') finish = chunk.reason
+    }
+  }
+
+  /**
+   * 档位可能不被宿主认（`UNSUPPORTED_REASONING_EFFORT`）或被上游直接拒（workbuddy 对 `off` 回 11133）。
+   * 一旦确认不支持就记在 `effortState` 上，之后不再白试一次——但绝不让它变成「不查」。
+   * 用独立的 state 对象而不是往 settings 上挂字段：live 设置是每轮现读的，挂上去会丢。
+   */
+  let effortUsed = effortState.unsupported === true ? undefined : settings.reasoningEffort
+  try {
+    try {
+      await collect(effortUsed)
+    } catch (error) {
+      const message = String((error && error.message) || error)
+      /**
+       * 两类拒绝都要认：
+       *  - 宿主侧 `does not support reasoning effort "…"` / `UNSUPPORTED_REASONING_EFFORT`；
+       *  - 上游侧 workbuddy 的 `11133 模型不接受当前请求`（实测 `off` 就撞这个，`low` 不会）。
+       */
+      const unsupported =
+        effortUsed !== undefined &&
+        (/reasoning effort/i.test(message) ||
+          /UNSUPPORTED_REASONING_EFFORT/i.test(message) ||
+          /11133/.test(message) ||
+          /不接受当前请求/.test(message))
+      if (!unsupported) throw error
+      effortState.unsupported = true
+      effortUsed = undefined
+      reset()
+      await collect(undefined)
     }
   } finally {
     clearTimeout(timer)
@@ -353,7 +543,7 @@ async function runJudge(llm, route, promptText, settings) {
   let verdict
   let parseError
   try {
-    verdict = parseVerdict(picked.text)
+    verdict = parse(picked.text)
   } catch (error) {
     parseError = error
   }
@@ -369,11 +559,11 @@ async function runJudge(llm, route, promptText, settings) {
   }
   if (picked.text.trim() === '') {
     throw fail(
-      `judge produced no text (finish=${info.finish}, ${info.judgeMs}ms, reasonChars=${info.reasonChars}, maxTokens=${settings.maxTokens})`,
+      `judge produced no text (finish=${info.finish}, ${info.judgeMs}ms, reasonChars=${info.reasonChars}, maxTokens=${settings.maxTokens}, effort=${info.effort})`,
     )
   }
   throw fail(
-    `${String((parseError && parseError.message) || parseError)} [finish=${info.finish}, ${info.judgeMs}ms, textChars=${info.textChars}, reasonChars=${info.reasonChars}]`,
+    `${String((parseError && parseError.message) || parseError)} [finish=${info.finish}, ${info.judgeMs}ms, textChars=${info.textChars}, reasonChars=${info.reasonChars}, effort=${info.effort}]`,
   )
 }
 
@@ -456,6 +646,7 @@ export function apply(ctx, config) {
     minReplyChars: int('minReplyChars', 0, 0),
     scoreThreshold: int('scoreThreshold', 70, 0),
     onUnknown: 'pass',
+    reasoningEffort: 'low',
     auditFile: '',
     criteriaFile: '',
     settingsFile: '',
@@ -478,6 +669,13 @@ export function apply(ctx, config) {
       throw new TypeError(`${name}: onUnknown must be 'pass' or 'rework'`)
     }
     settings.onUnknown = source.onUnknown
+  }
+  if (source.reasoningEffort !== undefined) {
+    const effort = source.reasoningEffort
+    if (effort !== 'off' && effort !== 'minimal' && effort !== 'low' && effort !== 'medium' && effort !== 'high') {
+      throw new TypeError(`${name}: reasoningEffort must be one of off/minimal/low/medium/high`)
+    }
+    settings.reasoningEffort = effort
   }
   if (source.model !== undefined) {
     const model = source.model
@@ -648,6 +846,11 @@ export function apply(ctx, config) {
         timeoutMs: pickInt(judge.timeoutMs, settings.timeoutMs, 1000, 120000),
         maxTokens: pickInt(judge.maxTokens, settings.maxTokens, 64, 8000),
         onUnknown: parsed.onUnknown === 'rework' ? 'rework' : parsed.onUnknown === 'pass' ? 'pass' : settings.onUnknown,
+        reasoningEffort:
+          typeof judge.reasoningEffort === 'string' &&
+          ['off', 'minimal', 'low', 'medium', 'high'].includes(judge.reasoningEffort)
+            ? judge.reasoningEffort
+            : settings.reasoningEffort,
         model: model ?? settings.model,
         auditFile: typeof parsed.auditFile === 'string' ? parsed.auditFile : settings.auditFile,
         criteria: Array.isArray(parsed.criteria)
@@ -702,21 +905,49 @@ export function apply(ctx, config) {
       }
 
       /**
-       * 判一次；拿不到分数就**换更便宜的提示补判一次**（只要一行 SCORE）。
-       * v5 的三值逻辑：unknown 不是「放行」的同义词，得先尽力把它变成 pass/fail。
+       * v6 判法，两级：
+       *  1. **清单模式**（判据里有编号条目时）：逐条 yes/no，分数由程序折算。
+       *     实测同一批用例 range 0~11，而「给个 0-100」是 range 54。
+       *  2. 拿不到清单就补判一次：清单压得更短（只要判定那一行、问题与回复都截一半）；
+       *     判据里没有编号条目时，两级都退回老的 `SCORE:` 问法。
+       * v5 的三值逻辑保留：unknown 不是「放行」的同义词，得先尽力把它变成 pass/fail。
        */
+      const items = checklistItems(live.criteria)
+      const effortState = { unsupported: false }
       let verdict
       let judgeError
       let retried = false
       try {
-        verdict = await runJudge(llm, route, judgePrompt(exchange.question, exchange.reply, live.criteria), live)
+        if (items.length > 0) {
+          verdict = await runJudge(
+            llm,
+            route,
+            checklistPrompt(exchange.question, exchange.reply, live.criteria, items),
+            live,
+            (text) => checklistVerdict(text, items),
+            effortState,
+          )
+        } else {
+          verdict = await runJudge(llm, route, judgePrompt(exchange.question, exchange.reply, live.criteria), live, parseVerdict, effortState)
+        }
       } catch (error) {
         judgeError = error
       }
       if (verdict === undefined) {
         retried = true
         try {
-          verdict = await runJudge(llm, route, scorePrompt(exchange.question, exchange.reply, live.criteria), live)
+          if (items.length > 0) {
+            verdict = await runJudge(
+              llm,
+              route,
+              checklistPrompt(exchange.question, exchange.reply, live.criteria, items, true),
+              live,
+              (text) => checklistVerdict(text, items),
+              effortState,
+            )
+          } else {
+            verdict = await runJudge(llm, route, scorePrompt(exchange.question, exchange.reply, live.criteria), live, parseVerdict, effortState)
+          }
           judgeError = undefined
         } catch (error) {
           judgeError = error
@@ -781,6 +1012,9 @@ export function apply(ctx, config) {
           decision,
           scoreSource: verdict.scoreSource,
           failed,
+          checks: verdict.checks,
+          incomplete: verdict.incomplete,
+          effort: verdict.effort,
           worst: verdict.worst,
           fix: verdict.fix,
           finish: verdict.finish,
