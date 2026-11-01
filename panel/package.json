@@ -1,0 +1,30 @@
+{
+  "name": "dsh-quality-guard",
+  "version": "0.1.0",
+  "private": true,
+  "description": "质检面板：把「发消息前质检」的触发条件与判据可视化，侧边栏一个入口，改完即时生效。引擎是同一仓库里的 engine/（selfcheck-guard）。",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-layout"
+      ],
+      "platform": "web"
+    }
+  },
+  "peerDependencies": {
+    "react": "^18.2.0"
+  },
+  "license": "MIT"
+}

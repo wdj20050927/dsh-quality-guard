@@ -1,0 +1,11 @@
+# dsh-quality-guard —— 「发消息前质检」的可视化面板。
+#
+# 两半：
+#   宿主半侧 lib/index.js  在同一个 web server 上开 /quality-guard/api（读写 settings.json）
+#   客户端半侧 lib/client.js 往侧边栏面板列表加一行「质检」，主栏加一页编辑器
+#
+# 真源是 ~/.dsh/quality-guard/settings.json：这一份 YAML 只负责把插件挂起来。
+# 引擎（selfcheck-guard）每轮现读 settings.json，所以页面改完下一轮就生效，不用重启。
+- insert:
+    - id: quality-guard
+      name: dsh-quality-guard

@@ -1,0 +1,15 @@
+# 运行时数据 —— 含你的真实对话复述，绝不入库
+audit.jsonl
+*.jsonl
+settings.json
+settings.json.bak
+
+# 本机备份 / 探针
+*.bak
+*.bak-*
+*.log
+
+# 常见杂物
+node_modules/
+.DS_Store
+Thumbs.db

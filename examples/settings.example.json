@@ -1,0 +1,50 @@
+{
+  "version": 1,
+  "enabled": true,
+  "dryRun": true,
+  "triggers": {
+    "minReplyChars": 0,
+    "maxReworks": 3,
+    "scoreThreshold": 70
+  },
+  "judge": {
+    "timeoutMs": 20000,
+    "maxTokens": 1500,
+    "model": null
+  },
+  "criteria": [
+    {
+      "id": "conclusion-first",
+      "label": "先说核心结论",
+      "enabled": true,
+      "text": "最核心的那一个因素/结论放在最前面直接给出；不许先复述问题、先讲背景、先铺垫。"
+    },
+    {
+      "id": "plain-words",
+      "label": "说人话，不用学术腔",
+      "enabled": true,
+      "text": "用最简单最直白的话说，像跟人当面讲话；不许学术腔、不许术语堆砌。（术语本身就是用户要的信息时不算违规）"
+    },
+    {
+      "id": "no-tangents",
+      "label": "不旁生枝节",
+      "enabled": true,
+      "text": "用户没问的方向不要主动展开；限定条件、例外情形不要全铺一遍。"
+    },
+    {
+      "id": "anchors",
+      "label": "数值必带出处",
+      "enabled": true,
+      "text": "出现具体数值或文献结论时，必须带可回查锚点（URL / DOI / PMID / arXiv / 文件路径 + 行号）。"
+    },
+    {
+      "id": "multi-question",
+      "label": "多个问句逐条对应",
+      "enabled": true,
+      "text": "用户的问题里含多个问句时，按「问题1+回答1、问题2+回答2」的顺序逐条对应，不许混着说。"
+    }
+  ],
+  "exceptions": "用户这一轮明确要了「详细说 / 完整版 / 全部列出来」→ 长和细都不算违规，只看有没有答在点子上。\n用户在赶时间、只要一个数或一个名字 → 多一句解释就算违规。",
+  "auditFile": "C:/Users/YOUR_NAME/.dsh/quality-guard/audit.jsonl",
+  "updatedAt": null
+}

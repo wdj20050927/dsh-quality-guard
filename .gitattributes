@@ -1,0 +1,4 @@
+# 统一用 LF 提交，避免跨平台 diff 噪音
+* text=auto eol=lf
+*.png binary
+*.jpg binary

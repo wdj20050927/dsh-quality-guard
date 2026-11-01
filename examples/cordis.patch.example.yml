@@ -1,0 +1,26 @@
+# 示例：追加到你自己的 ~/.dsh/profiles/<你的 profile>/cordis.patch.yml
+#
+# 把 C:/Users/YOUR_NAME 换成你自己的用户目录，路径用正斜杠。
+# 引擎是「按绝对路径挂一个 .mjs」；面板是「按包名挂」，包名靠 node_modules 里的目录联接解析。
+
+# ---- 引擎（必须）----
+- insert:
+    - id: selfcheck-guard
+      name: 'C:/Users/YOUR_NAME/.dsh/plugins/selfcheck-guard/index.mjs'
+      config:
+        # settingsFile：面板和手改都写这一份，引擎每轮现读，改完下一轮生效。
+        settingsFile: 'C:/Users/YOUR_NAME/.dsh/quality-guard/settings.json'
+        # criteriaFile：只在 settingsFile 读不到/没有 criteria 数组时才用。
+        criteriaFile: 'C:/Users/YOUR_NAME/.dsh/plugins/selfcheck-guard/criteria.example.md'
+        # auditFile：留空字符串＝不写审计日志。
+        auditFile: 'C:/Users/YOUR_NAME/.dsh/quality-guard/audit.jsonl'
+        # 下面这些是「patch 兜底值」，被 settings.json 里同名字段覆盖。
+        dryRun: true
+        maxReworks: 3
+        timeoutMs: 20000
+        maxTokens: 1500
+
+# ---- 面板（可选）----
+- insert:
+    - id: quality-guard
+      name: dsh-quality-guard
