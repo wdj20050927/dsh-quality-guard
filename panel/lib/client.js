@@ -27,10 +27,6 @@ window.__ModuleLoader__.load({
     /** 侧边栏行序：插件 0、自动化任务 10、看板 20、技能中心 30、ThoughtDAG 30 → 质检排 40。 */
     const PANEL_ORDER = 40
     const API_ROOT = '/quality-guard/api'
-    /** 引擎认的思考档位（与 selfcheck-guard/index.mjs 的 ALLOWED_EFFORTS 一致）。 */
-    const EFFORTS = ['off', 'minimal', 'low', 'medium', 'high']
-    /** 档位的中文名：面板上不出现英文，免得像没翻译完。 */
-    const EFFORT_LABELS = { off: '关', minimal: '最少', low: '少', medium: '中', high: '多' }
     /** 自带样式用「有主」的 <style>，重复加载时复用上一次的 sheet。 */
     const CSS_ID = `${NS}/client.css`
     const CSS = `
@@ -283,13 +279,11 @@ window.__ModuleLoader__.load({
         },
         judge: {
           timeoutMs: String(settings.judge.timeoutMs),
-          maxTokens: String(settings.judge.maxTokens),
           model: settings.judge.model,
         },
         criteria: settings.criteria.map((item) => ({ ...item })),
         exceptions: settings.exceptions,
         onUnknown: settings.onUnknown === 'rework' ? 'rework' : 'pass',
-        reasoningEffort: EFFORTS.includes(settings.reasoningEffort) ? settings.reasoningEffort : 'low',
       }
     }
 
@@ -321,13 +315,13 @@ window.__ModuleLoader__.load({
         },
         judge: {
           timeoutMs: int(draft.judge.timeoutMs, '判官超时', 1000, 120000),
-          maxTokens: int(draft.judge.maxTokens, '判官 token 上限', 64, 8000),
           model: draft.judge.model,
         },
         criteria,
         exceptions: draft.exceptions,
         onUnknown: draft.onUnknown === 'rework' ? 'rework' : 'pass',
-        reasoningEffort: EFFORTS.includes(draft.reasoningEffort) ? draft.reasoningEffort : 'low',
+        // v1.3.0：档位与输出预算由引擎自己定，面板只写 'auto'，不再收这两个输入框。
+        reasoningEffort: 'auto',
       }
     }
 
@@ -338,9 +332,8 @@ window.__ModuleLoader__.load({
       maxReworks: '同一条回复最多被打回几次，防死循环。0＝永不回炉。',
       scoreThreshold: '判官打分（0-100）低于这条线就算不过。',
       onUnknown: '判官两次都拿不到裁定（超时、断流、空输出）时怎么办。放行＝旧行为，风险是漏判；打回＝宁严不宽，会多花一轮。',
-      reasoningEffort: '判官思考多深。档位越高，推理越占 token、越容易把答案挤没。实测「关」会被上游拒绝，所以最低只到「少」。',
+      judgeAuto: '思考档位和输出预算由判官自己定：先用最省的档，判不出来才升级；预算随档位一起涨，保证答案不会被推理挤没。不用你填。',
       timeoutMs: '判官超过这么久没回话就放弃，本条放行。',
-      maxTokens: '判官最多能输出多少 token。',
     }
 
     function Switch({ checked, onChange, disabled }) {
@@ -753,22 +746,18 @@ window.__ModuleLoader__.load({
               unit: 'ms',
               onChange: (value) => patchDraft((next) => { next.judge.timeoutMs = value }),
             }),
-            h(NumberRow, {
-              title: '判官最多输出',
-              help: HELP.maxTokens,
-              value: draft.judge.maxTokens,
-              min: 64,
-              max: 8000,
-              unit: 'tok',
-              onChange: (value) => patchDraft((next) => { next.judge.maxTokens = value }),
-            }),
-            h(ChoiceRow, {
-              title: '判官思考多深',
-              help: HELP.reasoningEffort,
-              value: draft.reasoningEffort,
-              options: EFFORTS.map((effort) => ({ value: effort, label: EFFORT_LABELS[effort] })),
-              onChange: (value) => patchDraft((next) => { next.reasoningEffort = value }),
-            }),
+            // v1.3.0：档位和输出预算改由插件自动定，面板只留一行说明（不再让人手填）。
+            h(
+              'div',
+              { className: 'qg-row' },
+              h(
+                'div',
+                { className: 'qg-row-main' },
+                h('div', { className: 'qg-row-title' }, '思考档位 / 输出预算'),
+                h('div', { className: 'qg-row-help' }, HELP.judgeAuto),
+              ),
+              h('span', { className: 'qg-unit', style: { width: 'auto' } }, '自动'),
+            ),
             h(ChoiceRow, {
               title: '判官拿不到裁定时',
               help: HELP.onUnknown,

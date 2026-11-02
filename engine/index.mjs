@@ -38,7 +38,7 @@
  *     解析器分层兜底（行式 → JSON → 正则抢救），且**只要抢救到分数就按分数判**，不再要求完整 JSON。
  *  2. **分数优先于 finish**：`error`/`aborted` 也可能是「已经吐出分数才断的」，先解析，拿到分数就不抛。
  *  3. **三值裁定**：`pass | fail | unknown`。unknown 不再默认放行——先补判一次（只让判官补输出分数行），
- *     仍拿不到就按 `onUnknown` 处置（默认 `pass`，可设 `rework`）。unknown 一律写进审计，可回查。
+ *     仍拿不到就按 `onUnknown` 处置（v5 默认 `pass`，v7 起默认 `rework`）。unknown 一律写进审计，可回查。
  *  出处：anthropics/claude-cookbooks `capabilities/content_moderation/engine.py` 的
  *  「Any unknown that would matter yields decision `needs_review` rather than a confident verdict」。
  *
@@ -59,6 +59,17 @@
  *  结果用户判据表里「保持可爱的某某人设」这种风格项普通技术回复永远不满足——
  *  一条 80 分的回复照样被打回、`scoreThreshold` 形同虚设。
  *  ⇒ 改成只看**折算分数**与 `scoreThreshold` 比；第 1 条判 no 时满分压到 59，仍然必挂。
+ *
+ * v7（2026-11-02，契约 v1.3.0）：v6 把档位钉死在 `low`、预算钉死在 `maxTokens 4000`——两个都是拍的数。
+ *  生产审计（39 行带诊断）里 11 条 `judge returned no JSON` 的 reasonChars 最高 4614、答案均 210 字符，
+ *  即 4000 的预算被推理吃光；而 judgeMs 1876~12442ms 远没到 `timeoutMs=60000`——
+ *  也就是说**该升档重试的时候它没升，只是拿同一个档位原地重问一遍**。另外 `off` 档在 workbuddy 上会撞 11133。
+ *  ⇒ v7 两件事：
+ *    1. `reasoningEffort` 新增 `auto`（默认）：从 `AUTO_START` 起手，主判拿不到裁定时
+ *       **向上升一级**再补判一次（low→medium→high，到顶为止），而不是原地重问。显式 off/minimal
+ *       仍然尊重用户（含原有的「上游不认就退回不传」逻辑）。
+ *    2. `judge.maxTokens` 缺省/null 时按「档位 + 判据条数」自动算（`autoBudget`，见下），
+ *       随档位升高一起涨；给了数字才固定用那个数字（老行为的逃生舱）。
  */
 
 /** Cordis plugin name used by loader diagnostics. */
@@ -85,6 +96,97 @@ const ALLOWED_KEYS = new Set([
   'settingsFile',
   'model',
 ])
+
+/**
+ * v7：档位阶梯与自动预算。
+ *
+ * `AUTO_START` 是**单点可改**的起手档：`reasoningEffort: 'auto'`（以及没给值）就从这个档位起手，
+ * 主判失败后的补判沿 `EFFORT_ORDER` 向上升一级（到 `high` 为止）。
+ */
+export const AUTO_START = 'low'
+
+/** 档位从低到高。槽 2 的升级就沿这个顺序走，不在表里的档位一律按 `AUTO_START` 处理。 */
+const EFFORT_ORDER = ['off', 'minimal', 'low', 'medium', 'high']
+
+/**
+ * 各档位**实测 p99** 的思考 token 花费（v1.3.0 修订 A）。
+ *
+ * 依据：Anthropic 官方 task-budgets 页给的方法——「Start with the **p99** of your per-task
+ * token spend」，即按实测分位数取，而不是拍一个整数。low 取 3072：本机 verifier 9 次实测
+ * low 档 reasonChars 734~2431，而旧的 4000 预算在 reasonChars 4614 时被打爆。
+ */
+const THINKING_P99 = { off: 0, minimal: 1024, low: 3072, medium: 4096, high: 6144 }
+
+/** 在实测 p99 之上留的余量。 */
+const AUTO_BUDGET_FACTOR = 1.5
+
+/**
+ * 下限 4096。官方示例里短输出/结构化输出用的就是 1024/4096，
+ * 所以按官方精神取 4096 兜底，不再用 512。
+ */
+const AUTO_BUDGET_FLOOR = 4096
+
+/**
+ * 上限 8000。安全性有实测旁证（v1.3.0 修订 A 给的旁证）：上游中继
+ * `dsh-workbuddy-relay/src/wire.mjs:248` ——
+ * `if (Number.isFinite(input.maxTokens) && input.maxTokens > 0) body.max_tokens = Math.trunc(input.maxTokens)`，
+ * 我们给多少就原样下发；`adapter.mjs:307-309` 同样是「宿主给了就用宿主的」。
+ * 而模型 deepseek-v4.1-flash 的输出上限是 128000（wire.mjs:505），8000 远不触顶。
+ */
+const AUTO_BUDGET_CAP = 8000
+
+const clampNumber = (value, min, max) => Math.min(max, Math.max(min, value))
+
+/** 答案预留：随判据条数涨（一条清单判定约 48 token），夹在 256~1024。 */
+function answerReserve(items) {
+  return clampNumber(128 + 48 * (Number.isFinite(items) ? items : 0), 256, 1024)
+}
+
+/**
+ * v7：自动输出预算 = clamp(round(该档位 p99 × 1.5) + 答案预留, 4096, 8000)。
+ *
+ * 为什么药方是**抬高上限**而不是降档：官方 thinking-troubleshooting 页写的机制正是我们那 11 条
+ * `judge returned no JSON` 的成因——「thinking tokens count toward `max_tokens`, so a long
+ * thinking pass can consume the budget before the text response completes.」
+ * 它**不**用来控制思考成本：生产实测（v1.2 清单模式，audit 295 行里新增的 9 行，全带 `checks`+
+ * `effort:"low"`+`scoreSource:"checklist"`，route `loomy/DeepSeek-V4.1-Flash`）中 reasonChars 最高
+ * 7975 字符、`finish` 仍是 `stop`——旧的 4000 预算**没有**截断思考，说明上游中继的 `max_tokens` 对思考量
+ * 约束很弱。所以自动预算的意义只有一条：**别再把答案挤没**。成本控制只有「low 起手 + 拿不到裁定才升一级」这一层。
+ *
+ * 传进来的 `effort` 是**本槽真正要用的档位**；`auto` 或不在表里的值按 `AUTO_START` 算。
+ */
+export function autoBudget(effort, items = 0) {
+  const reserve = THINKING_P99[effort]
+  const p99 = reserve === undefined ? THINKING_P99[AUTO_START] : reserve
+  return clampNumber(Math.round(p99 * AUTO_BUDGET_FACTOR) + answerReserve(items), AUTO_BUDGET_FLOOR, AUTO_BUDGET_CAP)
+}
+
+/** 起手档：`auto`（以及缺省）落到 `AUTO_START`，显式档位原样尊重。 */
+function startEffort(settings) {
+  const value = settings?.reasoningEffort
+  return value === undefined || value === 'auto' ? AUTO_START : value
+}
+
+/** 槽 2：沿 `EFFORT_ORDER` 升一级，到顶不再升。 */
+function escalateEffort(effort) {
+  const index = EFFORT_ORDER.indexOf(effort)
+  if (index < 0) return AUTO_START
+  return EFFORT_ORDER[Math.min(index + 1, EFFORT_ORDER.length - 1)]
+}
+
+/**
+ * 本槽真正用的输出预算，以及它是不是自动算的（审计要如实把这两件事分开记，v1.3.0 修订 B）。
+ *
+ * 优先级（v1.3.0 修订 C）：活设置 `judge.maxTokens` 有数字 → 固定预算；否则 mount config 的
+ * `maxTokens` 有数字 → 固定预算（老挂载点里还留着 4000，部署时会删，但代码要认它）；
+ * 两者都没有/为 null → 自动。折算到 `live.maxTokens` 上就一句话：是数字就固定，否则按档位自动算。
+ */
+function slotBudget(settings, effort, items) {
+  if (typeof settings?.maxTokens === 'number') {
+    return { maxTokens: settings.maxTokens, maxTokensAuto: false }
+  }
+  return { maxTokens: autoBudget(effort, items), maxTokensAuto: true }
+}
 
 /** 本插件注入消息的 source.kind，用于自我识别（不会被当成用户说的话）。 */
 const GUARD_SOURCE = { kind: 'plugin:selfcheck-guard' }
@@ -468,23 +570,33 @@ function salvageText(text, reasoning) {
  * 顺序：解析 → 有分数就返回 → 没分数才按 finish 抛显式原因。
  *
  * v6 起两件事：
- *  1. 传 `reasoningEffort`（默认 `low`）。判官继承 profile 的 `high` 时，实测 91% 的 token 花在思考上，
+ *  1. 传 `reasoningEffort`（v6 默认 `low`；v7 起默认 `auto`＝从 `AUTO_START` 起手）。判官继承 profile 的 `high` 时，实测 91% 的 token 花在思考上，
  *     答案只剩两百来字符——这才是 `no JSON` 的真正成因。宿主/上游拒绝该档位时自动退回不传。
  *  2. `parse` 由调用方给：清单模式传 `checklistVerdict`，老问法传 `parseVerdict`。
+ *  3. v7：本槽的档位与预算走 `plan`（`{ effort, maxTokens, maxTokensAuto }`）——槽 2 要升档、预算也要跟着涨。
  */
-async function runJudge(llm, route, promptText, settings, parse = parseVerdict, effortState = {}) {
+async function runJudge(llm, route, promptText, settings, parse = parseVerdict, effortState = {}, plan = {}) {
   const controller = new AbortController()
   const started = Date.now()
   const timer = setTimeout(() => controller.abort(), settings.timeoutMs)
   let text = ''
   let reasoning = ''
   let finish
+  /**
+   * v7：本槽用哪个档位、给多少预算，由调用方算好传进来（槽 2 要升档，预算得跟着涨）。
+   * 以前这里直接写死 `settings.maxTokens`，所以「升档」也不可能真的多给预算。
+   */
+  const slotEffort = plan.effort
+  const budget = plan.maxTokens
+  const budgetAuto = plan.maxTokensAuto
   const meta = () => ({
     judgeMs: Date.now() - started,
     finish: finishLabel(finish),
     textChars: text.length,
     reasonChars: reasoning.length,
     effort: effortUsed ?? 'default',
+    maxTokens: budget,
+    maxTokensAuto: budgetAuto,
   })
   const fail = (message) => {
     const error = new Error(message)
@@ -502,7 +614,7 @@ async function runJudge(llm, route, promptText, settings, parse = parseVerdict, 
       model: route.model,
       system: JUDGE_SYSTEM,
       messages: [{ role: 'user', content: [{ type: 'text', text: promptText }] }],
-      maxTokens: settings.maxTokens,
+      maxTokens: budget,
       signal: controller.signal,
     }
     // 不传 = 继承 profile 的推理档位（本机是 high），那是 token 被吃光的原因。
@@ -520,7 +632,27 @@ async function runJudge(llm, route, promptText, settings, parse = parseVerdict, 
    * 一旦确认不支持就记在 `effortState` 上，之后不再白试一次——但绝不让它变成「不查」。
    * 用独立的 state 对象而不是往 settings 上挂字段：live 设置是每轮现读的，挂上去会丢。
    */
-  let effortUsed = effortState.unsupported === true ? undefined : settings.reasoningEffort
+  /**
+   * v1.3.1：**拒绝有两条路进来**。
+   *  - 抛错：`llm.stream()` 直接 throw（老版只接了这条）；
+   *  - 不抛错，把失败塞进 `finish.failure`（实测 `raccoon/sn-deepseek-v4-1-flash-1017` 对 `low` 就是这样，
+   *    `error: does not support reasoning effort "low" [0ms]`，judgeMs=0、textChars=0）。
+   * 老版漏了第二条，于是「退到不指定档位」的兜底不触发，两个槽都用同一个被拒的档位各撞一次，
+   * 最后 decision=unknown + onUnknown=rework，用户被白白打回三轮。所以两条路都要认。
+   */
+  const refusal = (message) =>
+    /reasoning effort/i.test(message) ||
+    /UNSUPPORTED_REASONING_EFFORT/i.test(message) ||
+    /11133/.test(message) ||
+    /不接受当前请求/.test(message)
+  /** finish 里带的失败原文；不是失败返回 undefined。 */
+  const finishFailure = () => {
+    if (finishLabel(finish) !== 'error') return undefined
+    const failure = finish?.failure
+    return failure === undefined || failure === null ? '' : String(failure.message ?? failure)
+  }
+
+  let effortUsed = effortState.unsupported === true ? undefined : slotEffort
   try {
     try {
       await collect(effortUsed)
@@ -529,19 +661,24 @@ async function runJudge(llm, route, promptText, settings, parse = parseVerdict, 
       /**
        * 两类拒绝都要认：
        *  - 宿主侧 `does not support reasoning effort "…"` / `UNSUPPORTED_REASONING_EFFORT`；
-       *  - 上游侧 workbuddy 的 `11133 模型不接受当前请求`（实测 `off` 就撞这个，`low` 不会）。
+       *  - 上游侧 workbuddy 的 `11133 模型不接受当前请求`（实测 `off` 就撞这个，`low` 不会）、
+       *    raccoon 的 `does not support reasoning effort "low"`（实测 `low` 也会撞）。
        */
-      const unsupported =
-        effortUsed !== undefined &&
-        (/reasoning effort/i.test(message) ||
-          /UNSUPPORTED_REASONING_EFFORT/i.test(message) ||
-          /11133/.test(message) ||
-          /不接受当前请求/.test(message))
-      if (!unsupported) throw error
+      if (effortUsed === undefined || !refusal(message)) throw error
       effortState.unsupported = true
       effortUsed = undefined
       reset()
       await collect(undefined)
+    }
+    // 第二条路：没抛错，但 finish 里写着「不支持这个档位」。同样退到不指定，别让这一槽白判。
+    if (effortUsed !== undefined) {
+      const message = finishFailure()
+      if (message !== undefined && refusal(message)) {
+        effortState.unsupported = true
+        effortUsed = undefined
+        reset()
+        await collect(undefined)
+      }
     }
   } finally {
     clearTimeout(timer)
@@ -569,7 +706,7 @@ async function runJudge(llm, route, promptText, settings, parse = parseVerdict, 
   }
   if (picked.text.trim() === '') {
     throw fail(
-      `judge produced no text (finish=${info.finish}, ${info.judgeMs}ms, reasonChars=${info.reasonChars}, maxTokens=${settings.maxTokens}, effort=${info.effort})`,
+      `judge produced no text (finish=${info.finish}, ${info.judgeMs}ms, reasonChars=${info.reasonChars}, maxTokens=${budget}, effort=${info.effort})`,
     )
   }
   throw fail(
@@ -600,6 +737,15 @@ function scorePrompt(question, reply, criteria = CRITERIA) {
   ].join('\n')
 }
 
+/**
+ * v7（契约修订 D）：打回提示会被模型照抄进最终回复。
+ *
+ * 生产实测：子代理被打回后，用户看到的开头就是这行方括号头——
+ * 「【质检未过·24 分·已被打回第 1/3 轮】—— 收到，按你的问 1+答 1 重写」，
+ * 而判官自己的 fix 写的正是「结论没前置」。所以两条文案末尾都把话说明白。
+ */
+const NO_REPEAT_HINT = '（这条提示不用在回复里复述，直接按要求重写。）'
+
 /** 回炉时塞回去的那条消息。 */
 function notice(verdict, attempt, maxReworks) {
   const head =
@@ -611,6 +757,7 @@ function notice(verdict, attempt, maxReworks) {
     verdict.worst === '' ? '这段回复不是用户要的样子。' : verdict.worst,
     verdict.fix === '' ? '' : `改法：${verdict.fix}`,
     '按用户的要求重写这条回复：最核心的那一点先说，用最直白的话讲；删掉铺垫、背景、他没问的旁支；数值和文献出处一条不少。',
+    NO_REPEAT_HINT,
   ]
   return lines.filter((line) => line !== '').join('\n')
 }
@@ -620,6 +767,7 @@ function noticeUnknown(attempt, maxReworks) {
   return [
     `【质检未过·判官这一轮没给出可用的判定·已被打回第 ${attempt}/${maxReworks} 轮】`,
     '按用户的要求重写这条回复：最核心的那一点先说，用最直白的话讲；删掉铺垫、背景、他没问的旁支；数值和文献出处一条不少。',
+    NO_REPEAT_HINT,
   ].join('\n')
 }
 
@@ -647,16 +795,28 @@ export function apply(ctx, config) {
     }
     return value
   }
+  /**
+   * v7：`maxTokens` 变成「可缺省」——缺省/null 表示自动预算（`autoBudget`），给了数字才固定。
+   * 非法值仍然当场报错，且报错文案与老 `int` 一致。
+   */
+  const optionalInt = (key, min) => {
+    const value = source[key] === undefined || source[key] === null ? undefined : source[key]
+    if (value === undefined) return undefined
+    if (!Number.isSafeInteger(value) || value < min) {
+      throw new TypeError(`${name}: ${key} must be a safe integer >= ${min}`)
+    }
+    return value
+  }
   const settings = {
     enabled: bool('enabled', true),
     dryRun: bool('dryRun', true),
     maxReworks: int('maxReworks', 3, 0),
     timeoutMs: int('timeoutMs', 60000, 1000),
-    maxTokens: int('maxTokens', 4000, 64),
+    maxTokens: optionalInt('maxTokens', 64),
     minReplyChars: int('minReplyChars', 0, 0),
     scoreThreshold: int('scoreThreshold', 70, 0),
-    onUnknown: 'pass',
-    reasoningEffort: 'low',
+    onUnknown: 'rework',
+    reasoningEffort: 'auto',
     auditFile: '',
     criteriaFile: '',
     settingsFile: '',
@@ -682,8 +842,8 @@ export function apply(ctx, config) {
   }
   if (source.reasoningEffort !== undefined) {
     const effort = source.reasoningEffort
-    if (effort !== 'off' && effort !== 'minimal' && effort !== 'low' && effort !== 'medium' && effort !== 'high') {
-      throw new TypeError(`${name}: reasoningEffort must be one of off/minimal/low/medium/high`)
+    if (effort !== 'auto' && !EFFORT_ORDER.includes(effort)) {
+      throw new TypeError(`${name}: reasoningEffort must be one of auto/off/minimal/low/medium/high`)
     }
     settings.reasoningEffort = effort
   }
@@ -816,6 +976,18 @@ export function apply(ctx, config) {
   }
   const pickBool = (value, fallback) => (typeof value === 'boolean' ? value : fallback)
 
+  /**
+   * v7（契约修订 C）：活设置里的 `judge.maxTokens` 怎么落到 live 上。
+   *  - 活设置有数字 → 那个数字（固定预算）；
+   *  - 否则 mount config 的 `maxTokens` 有数字 → 那个数字（老挂载点里还留着 4000，部署时会删，但代码要认它）；
+   *  - 两者都没有 / 为 null → undefined＝自动，由 `autoBudget(effort, items)` 现算；
+   *  - 非法值（越界、不是数字）→ 与老行为一致，回落到 mount 的值。
+   */
+  const pickBudget = (value, fallback) => {
+    if (value === null || value === undefined) return typeof fallback === 'number' ? fallback : undefined
+    return pickInt(value, fallback, 64, 8000)
+  }
+
   /** 文件没变就不重复解析（每轮都会走这里）。 */
   let liveCache = { key: '', value: null }
 
@@ -854,7 +1026,7 @@ export function apply(ctx, config) {
         minReplyChars: pickInt(triggers.minReplyChars, settings.minReplyChars, 0, 20000),
         scoreThreshold: pickInt(triggers.scoreThreshold, settings.scoreThreshold, 0, 100),
         timeoutMs: pickInt(judge.timeoutMs, settings.timeoutMs, 1000, 120000),
-        maxTokens: pickInt(judge.maxTokens, settings.maxTokens, 64, 8000),
+        maxTokens: pickBudget(judge.maxTokens, settings.maxTokens),
         onUnknown: parsed.onUnknown === 'rework' ? 'rework' : parsed.onUnknown === 'pass' ? 'pass' : settings.onUnknown,
         /**
          * 面板把这一项写在**顶层** `reasoningEffort`（和 `onUnknown` 一样），
@@ -862,7 +1034,7 @@ export function apply(ctx, config) {
          */
         reasoningEffort: (() => {
           const value = typeof parsed.reasoningEffort === 'string' ? parsed.reasoningEffort : judge.reasoningEffort
-          return typeof value === 'string' && ['off', 'minimal', 'low', 'medium', 'high'].includes(value)
+          return typeof value === 'string' && ['auto', ...EFFORT_ORDER].includes(value)
             ? value
             : settings.reasoningEffort
         })(),
@@ -885,6 +1057,28 @@ export function apply(ctx, config) {
     const fromFile = readLive()
     if (fromFile !== null) return fromFile
     return { ...settings, criteria: criteriaText() }
+  }
+
+  // ── v1.3.1：跨轮记住「这个路由不认档位」，别再每轮白撞一次 ──────────────
+  /**
+   * `effortState` 目前只在一次检查里有效（两个槽共用）。但「provider/model 不支持 reasoning effort」
+   * 是**路由级**的事实，不随轮次变：实测 `raccoon/sn-deepseek-v4-1-flash-1017` 对 `low` 直接拒，
+   * 每轮都白撞一次 = 每轮多一次上游调用、判官还多白等 0ms~几秒。
+   * 这里按 `provider/model` 记一条进程内黑名单：撞过一次之后，同一路由直接不带档位。
+   * 只记「明确说了不支持档位」的，真错误（502/超时）不进这张表。
+   */
+  const effortRefused = new Map()
+  const routeKey = (route) => `${route.provider}/${route.model}`
+  const effortStateFor = (route) => ({ unsupported: effortRefused.get(routeKey(route)) === true })
+  const rememberRefusal = (route) => {
+    const key = routeKey(route)
+    if (effortRefused.get(key) === true) return
+    effortRefused.set(key, true)
+    try {
+      ctx.logger?.warn?.(`${name}: ${key} does not accept a reasoning-effort level; will judge without one from now on`)
+    } catch {
+      // 吞掉。
+    }
   }
 
   ctx.on('agent/turn-stopping', async ({ agent, turn }) => {
@@ -926,48 +1120,60 @@ export function apply(ctx, config) {
        *  2. 拿不到清单就补判一次：清单压得更短（只要判定那一行、问题与回复都截一半）；
        *     判据里没有编号条目时，两级都退回老的 `SCORE:` 问法。
        * v5 的三值逻辑保留：unknown 不是「放行」的同义词，得先尽力把它变成 pass/fail。
+       * v7：两个槽＝两个**档位槽**。槽 1 用起手档，槽 2 向上升一级（low→medium→high，到顶为止），
+       *     并且输出预算按新档位重算（自动预算下 medium 比 low 多 2048 token）——
+       *     以前槽 2 只是「同样的档位、同样的预算」重问一遍，该升的时候没升。
        */
       const items = checklistItems(live.criteria)
-      const effortState = { unsupported: false }
-      let verdict
-      let judgeError
-      let retried = false
-      try {
+      const effortState = effortStateFor(route)
+      const firstEffort = startEffort(live)
+      const secondEffort = escalateEffort(firstEffort)
+      const plans = [
+        { effort: firstEffort, ...slotBudget(live, firstEffort, items.length) },
+        { effort: secondEffort, ...slotBudget(live, secondEffort, items.length) },
+      ]
+      /**
+       * 一个槽的判定：清单模式传清单提示（`brief` 时压得更短），
+       * 没有编号条目就退回只问分数的老提示。
+       */
+      const judgeSlot = (plan, brief) => {
         if (items.length > 0) {
-          verdict = await runJudge(
+          return runJudge(
             llm,
             route,
-            checklistPrompt(exchange.question, exchange.reply, live.criteria, items),
+            checklistPrompt(exchange.question, exchange.reply, live.criteria, items, brief),
             live,
             (text) => checklistVerdict(text, items, live.scoreThreshold),
             effortState,
+            plan,
           )
-        } else {
-          verdict = await runJudge(llm, route, judgePrompt(exchange.question, exchange.reply, live.criteria), live, parseVerdict, effortState)
         }
+        const prompt = brief
+          ? scorePrompt(exchange.question, exchange.reply, live.criteria)
+          : judgePrompt(exchange.question, exchange.reply, live.criteria)
+        return runJudge(llm, route, prompt, live, parseVerdict, effortState, plan)
+      }
+      let verdict
+      let judgeError
+      let attempts = 0
+      try {
+        attempts = 1
+        verdict = await judgeSlot(plans[0], false)
       } catch (error) {
         judgeError = error
       }
       if (verdict === undefined) {
-        retried = true
+        attempts = 2
         try {
-          if (items.length > 0) {
-            verdict = await runJudge(
-              llm,
-              route,
-              checklistPrompt(exchange.question, exchange.reply, live.criteria, items, true),
-              live,
-              (text) => checklistVerdict(text, items, live.scoreThreshold),
-              effortState,
-            )
-          } else {
-            verdict = await runJudge(llm, route, scorePrompt(exchange.question, exchange.reply, live.criteria), live, parseVerdict, effortState)
-          }
+          verdict = await judgeSlot(plans[1], true)
           judgeError = undefined
         } catch (error) {
           judgeError = error
         }
       }
+      const retried = attempts === 2
+      // 这一轮撞过「路由不认档位」就记下来，下一轮同路由直接不带档位（见 effortRefused 的注释）。
+      if (effortState.unsupported === true) rememberRefusal(route)
 
       const base = {
         turn,
@@ -977,6 +1183,7 @@ export function apply(ctx, config) {
         route: `${route.provider}/${route.model}`,
         chars: exchange.reply.length,
         retried,
+        attempts,
       }
 
       // ── UNKNOWN 出口 ────────────────────────────────────────────────
@@ -1030,6 +1237,8 @@ export function apply(ctx, config) {
           checks: verdict.checks,
           incomplete: verdict.incomplete,
           effort: verdict.effort,
+          maxTokens: verdict.maxTokens,
+          maxTokensAuto: verdict.maxTokensAuto,
           worst: verdict.worst,
           fix: verdict.fix,
           finish: verdict.finish,

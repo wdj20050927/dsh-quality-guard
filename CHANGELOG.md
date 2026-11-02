@@ -1,5 +1,64 @@
 # 更新日志
 
+## v1.3.1 — 2026-11-02
+
+v1.3.0 上线当天在生产审计里露了真身：`raccoon/sn-deepseek-v4-1-flash-1017` 这个路由**不认任何思考档位**，而 v1.3.0 的「档位不被认就退回不传」兜底只接了 `llm.stream()` **抛错**那条路——它不抛错，把失败塞进 `finish.failure` 里。结果两个槽用同一个被拒的档位各撞一次，`decision:unknown` + `onUnknown:rework` 把用户白打回三轮（审计原文 `does not support reasoning effort "low" [0ms]`、`judgeMs:0`、`textChars:0`）。
+
+### 引擎 `engine/index.mjs`
+
+- **拒绝有两条路，现在两条都认**：`runJudge` 里新增 `finishFailure()`——流正常结束但 `finish` 是 `error` 且原文匹配档位拒绝（`/reasoning effort/i`、`/UNSUPPORTED_REASONING_EFFORT/i`、`/11133/`、`/不接受当前请求/`）时，同样退到「不传档位」重试一次，不再白判一槽。
+- **路由级记忆**：`apply()` 里新增 `effortRefused`（`provider/model` → 是否拒过档位）。某个路由某轮拒过，下一轮起就不再带 `reasoningEffort`，并 `ctx.logger.warn` 一句。只记「明确说不支持档位」，502/超时不进表。
+- 自测新增用例 62/63/64 钉住三件事：`finish.failure` 式拒绝要退回、`finish` 真错误**不许**误当档位拒绝、拒过的路由下一轮只调一次上游。
+
+### 部署备忘（不是代码，但下次别踩）
+
+- `apply start` 只重建 cordis fiber，**ESM 模块缓存不会失效**；同一路径改内容不会重载，**换文件名才会**。想免重启上线引擎，必须换文件名 + `plugin_manager` 开关 `include:selfcheck-guard`（注意：改过挂载点 `name` 后该 entry 会变 `unaddressable`，之后只能改 patch 文件 + 重启，所以**最终要把 `name` 收回 `index.mjs`**，靠换文件名上线只在当下那次有效）。
+
+### 测试
+
+- `node engine/selftest.mjs` → **190 passed, 0 failed**（v1.3.0 基线 181）。
+
+## v1.3.0 — 2026-11-01
+
+用户一句话：「对于判官的几档和优化我的感觉是你不要让用户自己去填，肯定有一个最优解……然后做就行了。」这一版就把「判官思考多深」和「判官最多输出」从**手填**改成**插件自己定**。
+
+### 引擎 `engine/index.mjs`
+
+- **`reasoningEffort` 新增 `'auto'` 且为默认**：判官先用最省的那档（`low`；`off` 会被上游 11133 拒，不可用）起步，拿不到裁定才升一档重判。
+- **输出预算自动算**：`maxTokens` 随档位一起涨，保证判定行与 `FIX:` 不会被推理挤没；手写死 `judge.maxTokens` 仍当显式上限（逃生舱）。
+- **`onUnknown` 默认改成 `'rework'`**：判官两次都拿不到裁定就打回重写，宁可多花一轮，也不静默放行。
+- **活设置的顶层 `reasoningEffort` 现在代码端也认**（9a86f7b）：面板写在**顶层**（和 `onUnknown` 一样），引擎早期只读 `judge.reasoningEffort`，导致面板改了引擎看不见。
+
+### 面板 `panel/`
+
+- 删掉「判官思考多深」五档选择与「判官最多输出」数字框，换成一行只读说明：「思考档位和输出预算由判官自己定：先用最省的档，判不出来才升级；预算随档位一起涨，保证答案不会被推理挤没。不用你填。」
+- `settings.js` 的 `defaults()` / `normalize()` / `FIELD_HELP` 与 `client.js` 的 `HELP` 同步：保存时写 `reasoningEffort: 'auto'`，`judge` 里不再写 `maxTokens`（旧文件里的 `judge.maxTokens` 保存时丢弃、五档旧值归一成 `auto`）。
+- `onUnknown` 的默认值 `'pass'` → `'rework'`：与引擎默认同向，不允许两套默认（面板落盘的 `settings.json` 会盖掉引擎兜底）。
+
+### 文档
+
+- README「配置」章：删掉 `judge.maxTokens` 一行与五档说明，`reasoningEffort` 改为 `auto`，并加一段「判官的档位和输出预算不用你填」；安装示例不再写 `maxTokens`，注明填数字＝关掉自动预算。
+- `examples/settings.example.json` 同步：`reasoningEffort: 'auto'`、`onUnknown: 'rework'`、去掉 `judge.maxTokens`；`examples/cordis.patch.example.yml` 删掉 `maxTokens: 4000` 兜底行，改成注释说明。
+- 补上缺失的 v1.2.1 独立小节（原先只在 README 里写了一句）。
+
+### 测试
+
+- `node engine/selftest.mjs` → **181 passed, 0 failed**（v1.2.0 基线 137）：本版新增自动档位 / 自动预算 / `onUnknown` 默认用例。
+
+## v1.2.1 — 2026-11-01
+
+补 v1.2.0 的账：清单模式上线后，判据里只要有一条永远不满足的项（实测是「保持可爱的某某人设」这类风格项），「任一条 no 即整条打回」就会让 `scoreThreshold` 形同虚设——一条 80 分的好回复照样被打回、回炉重写。
+
+### 引擎 `engine/index.mjs`
+
+- **及格与否只看折算分数**（`checklistVerdict(text, items, threshold)`）：折算分低于 `triggers.scoreThreshold` 才打回，不再「有哪一条判了 no 就打回」。
+- **第 1 条仍是硬门槛**：第 1 条（结论前置）判 no 时折算上限压到 59 分，必然低于及格线——它不过就是整段跑偏了。
+- 实测：同一条 80 分回复从 `decision=fail`、`steered=1` 变成 `pass`、不回炉；坏回复 12 分仍然 `fail`、回炉。判据表里有「人设 / 口吻」这类风格项时，及格线才真的起作用。
+
+### 文档
+
+- README 补「及格与否只看折算出来的分数」一段；`engine/index.mjs` 文件头补 v6.1 及格线语义（47f44c5、b7b65c3）。
+
 ## v1.2.0 — 2026-11-01
 
 v1.1.0 治的是「分数被丢掉了」，这一版治的是**分数根本不该那么难产、也不该那么飘**。

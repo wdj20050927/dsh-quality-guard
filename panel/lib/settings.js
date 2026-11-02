@@ -66,15 +66,15 @@ export function defaults() {
     enabled: true,
     dryRun: true,
     triggers: { minReplyChars: 0, maxReworks: 3, scoreThreshold: 70 },
-    // 800 会把判官的 JSON 截断（实测 7 条审计里 2 条 "judge returned no JSON"），v1.0.1 起提到 4000。
-    // 超时同步提到 60s：20s 时有过「abort 后一个字都没吐」，而 abort 在 SDK 里不报 error，引擎看不出来。
-    judge: { timeoutMs: 60000, maxTokens: 4000, model: null },
+    // v1.3.0 起判官最多能输出多少 token 由引擎按思考档位自动算，面板不再收这一项。
+    // 超时保持 60s：20s 时有过「abort 后一个字都没吐」，而 abort 在 SDK 里不报 error，引擎看不出来。
+    judge: { timeoutMs: 60000, model: null },
     // 判官两次都拿不到裁定时的出口（v5 三值逻辑的 unknown）：
-    // 'pass' ＝ 放行（旧行为，风险是漏判）；'rework' ＝ 打回重写（宁严不宽）。
-    onUnknown: 'pass',
-    // 判官的思考档位（v6）。实测判官 91% 的输出字符花在推理上，4000 token 会被吃光。
-    // 'off' 在本机 relay 上会被上游 11133 拒（模型不接受该请求），所以默认用能用的最低档 'low'。
-    reasoningEffort: 'low',
+    // 'pass' ＝ 放行（旧行为，风险是漏判）；'rework' ＝ 打回重写（宁严不宽，v1.3.0 起为默认）。
+    onUnknown: 'rework',
+    // 判官的思考档位（v6）。'auto' ＝ 引擎自己定：先用最省的档，判不出来才升级，预算随档位一起涨。
+    // 实测判官 91% 的输出字符花在推理上，手填档位很容易把答案挤没，所以 v1.3.0 起面板不再让用户选。
+    reasoningEffort: 'auto',
     criteria: DEFAULT_CRITERIA.map((item) => ({ ...item })),
     exceptions: DEFAULT_EXCEPTIONS,
     auditFile: AUDIT_FILE.replace(/\\/g, '/'),
@@ -89,19 +89,15 @@ export const FIELD_HELP = {
   minReplyChars: '回复短于这个字数就跳过检查。0＝每条都查（连「好的」也查）。',
   maxReworks: '同一条回复最多被打回几次，防死循环。0＝永不回炉。',
   scoreThreshold: '判官打分的及格线（0-100）。低于它就算不过。',
-  onUnknown: '判官两次都拿不到裁定（超时、断流、空输出）时怎么办。放行＝旧行为，风险是漏判；打回＝宁严不宽，会多花一轮。',
-  reasoningEffort: '判官思考多深。档位越高，推理越占 token、越容易把答案挤没。实测「关」会被上游拒绝，所以最低只到「少」。',
+  onUnknown: '判官两次都拿不到裁定（超时、断流、空输出）时怎么办。放行＝旧行为，风险是漏判；打回＝宁严不宽，会多花一轮。v1.3.0 起默认打回。',
+  reasoningEffort: '判官思考多深、最多能输出多少 token——这两项由判官自己定。先用最省的档，判不出来才升级；预算随档位一起涨，保证答案不会被推理挤没。面板上不用你填。',
   timeoutMs: '判官超过这么久没回话就放弃，本条放行。',
-  maxTokens: '判官最多能输出多少 token。',
   criteria: '判官手里那张尺子。勾掉＝这一条不再检查。',
   exceptions: '例外情形：写在这里的，判官不按上面的判据算违规。一行一条。',
 }
 
 const MAX_TEXT = 2000
 const MAX_EXCEPTIONS = 4000
-
-/** 引擎认的思考档位（与 selfcheck-guard/index.mjs 的 ALLOWED_EFFORTS 保持一致）。 */
-const EFFORTS = ['off', 'minimal', 'low', 'medium', 'high']
 
 function fail(message) {
   const error = new Error(message)
@@ -185,13 +181,13 @@ export function normalize(input) {
     },
     judge: {
       timeoutMs: pickInt(judge.timeoutMs, '判官超时', base.judge.timeoutMs, 1000, 120000),
-      maxTokens: pickInt(judge.maxTokens, '判官 token 上限', base.judge.maxTokens, 64, 8000),
       model,
     },
     criteria,
     exceptions: exceptions.trim(),
     onUnknown: input.onUnknown === 'rework' ? 'rework' : input.onUnknown === 'pass' ? 'pass' : base.onUnknown,
-    reasoningEffort: EFFORTS.includes(input.reasoningEffort) ? input.reasoningEffort : base.reasoningEffort,
+    // v1.3.0：档位与输出预算由引擎自己定，面板只写 'auto'（旧文件里的 low/high 等值保存时一并归一）。
+    reasoningEffort: 'auto',
     auditFile: auditFile.replace(/\\/g, '/'),
     updatedAt: typeof input.updatedAt === 'string' ? input.updatedAt : null,
   }

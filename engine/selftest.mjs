@@ -6,7 +6,7 @@
  */
 
 import fs from 'node:fs'
-import { apply, name } from './index.mjs'
+import { apply, name, autoBudget, AUTO_START } from './index.mjs'
 
 let passed = 0
 let failed = 0
@@ -220,17 +220,18 @@ console.log(`${name} selftest`)
 }
 
 // 7. 判官调用抛错 → 补判一次仍失败则放行，不弄坏会话
+// （v7 起 onUnknown 默认是 rework，这条测的是「显式选择放行」这条路径，所以要显式传 pass）
 {
-  const h = harness({ dryRun: false }, fakeLlm(new Error('upstream 502')), baseEvents)
+  const h = harness({ dryRun: false, onUnknown: 'pass' }, fakeLlm(new Error('upstream 502')), baseEvents)
   await h.stop()
   check('判官抛错则放行', h.steered.length === 0)
   check('判官抛错留了日志', h.warned.some((line) => line.includes('letting the turn close')), h.warned.join(' | '))
 }
 
-// 8. 判官返回非 JSON 也非分数 → 补判一次，仍拿不到就放行（v5：unknown 出口）
+// 8. 判官返回非 JSON 也非分数 → 补判一次，仍拿不到就放行（v5：unknown 出口；显式 onUnknown=pass）
 {
   const llm = fakeLlm('我觉得还行吧')
-  const h = harness({ dryRun: false }, llm, baseEvents)
+  const h = harness({ dryRun: false, onUnknown: 'pass' }, llm, baseEvents)
   await h.stop()
   check('非法输出则放行', h.steered.length === 0)
   check('非法输出会补判一次', llm.calls.length === 2, `calls=${llm.calls.length}`)
@@ -346,7 +347,7 @@ console.log(`${name} selftest`)
 {
   const audit = tmpFile('audit-aborted')
   const h = harness(
-    { dryRun: false, auditFile: audit },
+    { dryRun: false, auditFile: audit, onUnknown: 'pass' },
     fakeLlmChunks([{ type: 'finish', reason: { kind: 'aborted', failure: { code: 'ABORTED', message: 'aborted' } } }]),
     baseEvents,
   )
@@ -363,7 +364,7 @@ console.log(`${name} selftest`)
 {
   const audit = tmpFile('audit-maxtokens')
   const h = harness(
-    { dryRun: false, auditFile: audit },
+    { dryRun: false, auditFile: audit, onUnknown: 'pass' },
     fakeLlmChunks([{ type: 'finish', reason: { kind: 'max-tokens' } }]),
     baseEvents,
   )
@@ -464,15 +465,18 @@ console.log(`${name} selftest`)
   fs.unlinkSync(audit)
 }
 
-// 26. v5：两次都拿不到 → onUnknown=pass 放行，但审计留下 decision=unknown
+// 26. v7：onUnknown 默认变成 rework —— 两次都拿不到裁定就打回，审计留 decision=unknown
 {
   const audit = tmpFile('audit-unknown')
   const h = harness({ dryRun: false, auditFile: audit }, fakeLlm('我不知道'), baseEvents)
   await h.stop()
-  check('unknown 默认放行', h.steered.length === 0, `steered=${h.steered.length}`)
+  check('unknown 默认打回（v7 默认 rework）', h.steered.length === 1, `steered=${h.steered.length}`)
   const row = lastAuditRow(audit)
   check('unknown 写进审计', row.decision === 'unknown', JSON.stringify(row))
   check('unknown 审计带原因', String(row.error ?? '').includes('no score'), JSON.stringify(row))
+  check('unknown 审计记 onUnknown=rework', row.onUnknown === 'rework', JSON.stringify(row))
+  check('unknown 审计记 attempts=2', row.attempts === 2, JSON.stringify(row))
+  check('unknown 审计记实际 maxTokens', Number.isFinite(row.maxTokens), JSON.stringify(row))
   fs.unlinkSync(audit)
 }
 
@@ -528,7 +532,7 @@ console.log(`${name} selftest`)
   let unknown = 0
   for (const item of cases) {
     const audit = tmpFile('audit-reg')
-    const h = harness({ dryRun: false, auditFile: audit }, fakeLlm(item.judgeOutput), baseEvents)
+    const h = harness({ dryRun: false, auditFile: audit, onUnknown: 'pass' }, fakeLlm(item.judgeOutput), baseEvents)
     await h.stop()
     const row = lastAuditRow(audit)
     if (item.expectedScore === null) {
@@ -566,9 +570,9 @@ console.log(`${name} selftest`)
   fs.unlinkSync(audit)
 }
 
-// 32. v5：判官只说了 pass、没给数字 → 没有依据的放行不接受，走补判后 unknown
+// 32. v5：判官只说了 pass、没给数字 → 没有依据的放行不接受，走补判后 unknown（显式 onUnknown=pass）
 {
-  const h = harness({ dryRun: false }, fakeLlm('VERDICT: pass'), baseEvents)
+  const h = harness({ dryRun: false, onUnknown: 'pass' }, fakeLlm('VERDICT: pass'), baseEvents)
   await h.stop()
   check('只说 pass 没分数不算数', h.steered.length === 0, `steered=${h.steered.length}`)
   check('只说 pass 会触发补判', h.warned.some((line) => line.includes('onUnknown=pass')), h.warned.join(' | '))
@@ -771,16 +775,17 @@ const checklistHarness = (llm, config = {}) => {
   check('上游 11133 退回后不传 effort', llm.calls[1]?.reasoningEffort === undefined, `effort=${llm.calls[1]?.reasoningEffort}`)
 }
 
-// 45. v6：真错误（不是档位问题）不许被当成「档位不支持」而丢掉 effort
+// 45. v6/v7：真错误（不是档位问题）不许被当成「档位不支持」而丢掉 effort；槽 2 还要升一级
 {
   const llm = fakeLlm(new Error('upstream 502 bad gateway'))
   const audit = tmpFile('audit-effort-real-error')
   const h = harness({ dryRun: false, auditFile: audit }, llm, baseEvents)
   await h.stop()
-  // 两次调用＝一次主判 + 一次补判；关键是两次都还带着 effort，没被误判成「档位不支持」。
-  check('真错误两次调用都保留 effort', llm.calls.every((call) => call.reasoningEffort === 'low'), llm.calls.map((call) => call.reasoningEffort).join(','))
+  // 两次调用＝一次主判 + 一次补判；关键是两次都还带着 effort（low→medium 是升档，不是丢失）。
+  check('真错误两槽都保留 effort（low,medium）', llm.calls.map((call) => call.reasoningEffort).join(',') === 'low,medium', llm.calls.map((call) => call.reasoningEffort).join(','))
   const row = lastAuditRow(audit)
   check('真错误走 unknown 出口', row.decision === 'unknown', JSON.stringify(row))
+  check('真错误审计记 attempts=2', row.attempts === 2, JSON.stringify(row))
   fs.unlinkSync(audit)
 }
 // 46. v6：截断也要能判——判定在第一行，尾巴掉了不影响
@@ -849,6 +854,390 @@ const checklistHarness = (llm, config = {}) => {
   check('活设置顶层 effort 记进审计', row.effort === 'minimal', `effort=${row.effort}`)
   fs.unlinkSync(audit)
   fs.unlinkSync(settingsFile)
+}
+
+/**
+ * ── v7（契约 v1.3.0）：判官档位与输出预算全部自动化 ────────────────────────────
+ *
+ * 背景（生产审计实测）：11 条 `judge returned no JSON` 的 reasonChars 最高 4614、答案均 210 字符
+ * ＝ 4000 的预算被推理吃光；judgeMs 最大 12442ms，远没到 timeoutMs 60000
+ * ＝ 该升档的时候只是拿同一个档位原地重问一遍。
+ */
+
+// 49. v7：档位默认 auto，起手档就是导出常量 AUTO_START
+{
+  const llm = fakeLlm('1:yes 2:yes 3:yes')
+  const h = harness({ dryRun: false }, llm, baseEvents)
+  await h.stop()
+  check('AUTO_START 是 low（契约 v1.3.0）', AUTO_START === 'low', AUTO_START)
+  check('默认 auto 从 AUTO_START 起手', llm.calls[0]?.reasoningEffort === AUTO_START, `effort=${llm.calls[0]?.reasoningEffort}`)
+}
+
+// 50. v7：显式写 'auto' 与不写等价
+{
+  const llm = fakeLlm('1:yes 2:yes 3:yes')
+  const h = harness({ dryRun: false, reasoningEffort: 'auto' }, llm, baseEvents)
+  await h.stop()
+  check('显式 auto 起手 low', llm.calls[0]?.reasoningEffort === 'low', `effort=${llm.calls[0]?.reasoningEffort}`)
+}
+
+// 51. v7：槽 2 升一级，且预算按新档位重算（自动预算下 medium 比 low 多 2048）
+{
+  let attempt = 0
+  const llm = {
+    calls: [],
+    stream(options) {
+      this.calls.push(options)
+      attempt += 1
+      const body = attempt === 1 ? '我先想想……' : '1:yes 2:yes 3:yes'
+      return (async function* () {
+        yield { type: 'text-delta', index: 0, text: body }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      })()
+    },
+  }
+  const audit = tmpFile('audit-slot-upgrade')
+  const h = checklistHarness(llm, { auditFile: audit })
+  await h.stop()
+  const row = lastAuditRow(audit)
+  check('槽 1 起手 low', llm.calls[0]?.reasoningEffort === 'low', `effort=${llm.calls[0]?.reasoningEffort}`)
+  check('槽 2 升到 medium', llm.calls[1]?.reasoningEffort === 'medium', `effort=${llm.calls[1]?.reasoningEffort}`)
+  check('槽 1 预算按 low 算', llm.calls[0]?.maxTokens === autoBudget('low', 3), `budget=${llm.calls[0]?.maxTokens}`)
+  check('槽 2 预算按 medium 重算', llm.calls[1]?.maxTokens === autoBudget('medium', 3), `budget=${llm.calls[1]?.maxTokens}`)
+  check('槽 2 预算真的比槽 1 大', llm.calls[1]?.maxTokens > llm.calls[0]?.maxTokens, `${llm.calls[0]?.maxTokens} -> ${llm.calls[1]?.maxTokens}`)
+  check('审计记 attempts=2', row.attempts === 2, JSON.stringify(row))
+  check('审计记实到的档位 medium', row.effort === 'medium', JSON.stringify(row))
+  check('审计记实际用的 maxTokens', row.maxTokens === autoBudget('medium', 3), JSON.stringify(row))
+  h.cleanup()
+  fs.unlinkSync(audit)
+}
+
+// 52. v7：到顶不再升（显式 high 时槽 2 还是 high）
+{
+  const llm = fakeLlm(new Error('upstream 502 bad gateway'))
+  const h = harness({ dryRun: false, onUnknown: 'pass', reasoningEffort: 'high' }, llm, baseEvents)
+  await h.stop()
+  check('high 到顶不越界', llm.calls.map((call) => call.reasoningEffort).join(',') === 'high,high', llm.calls.map((call) => call.reasoningEffort).join(','))
+}
+
+// 53. v7：显式 maxTokens 仍是逃生舱 —— 两槽都用这个数字，不做自动预算
+{
+  const llm = fakeLlm('1:yes 2:yes 3:yes')
+  const audit = tmpFile('audit-fixed-tokens')
+  const h = checklistHarness(llm, { auditFile: audit, maxTokens: 900 })
+  await h.stop()
+  const row = lastAuditRow(audit)
+  check('显式 maxTokens 照用', llm.calls[0]?.maxTokens === 900, `budget=${llm.calls[0]?.maxTokens}`)
+  check('显式 maxTokens 写进审计', row.maxTokens === 900, JSON.stringify(row))
+  check('显式 maxTokens 不改起手档', llm.calls[0]?.reasoningEffort === 'low', `effort=${llm.calls[0]?.reasoningEffort}`)
+  h.cleanup()
+  fs.unlinkSync(audit)
+}
+
+// 54. v7（修订 A）：autoBudget = clamp(round(p99×1.5) + 答案预留, 4096, 8000)
+{
+  // 契约钉死的五个点（items=5 时）：off/minimal 被 4096 兜住，low 4976、medium 6512、high 被 8000 兜住
+  check('autoBudget off/5 = 4096（下限兜底）', autoBudget('off', 5) === 4096, String(autoBudget('off', 5)))
+  check('autoBudget minimal/5 = 4096（下限兜底）', autoBudget('minimal', 5) === 4096, String(autoBudget('minimal', 5)))
+  check('autoBudget low/5 = 4976', autoBudget('low', 5) === 4976, String(autoBudget('low', 5)))
+  check('autoBudget medium/5 = 6512', autoBudget('medium', 5) === 6512, String(autoBudget('medium', 5)))
+  check('autoBudget high/5 = 8000（上限封顶）', autoBudget('high', 5) === 8000, String(autoBudget('high', 5)))
+  // 答案预留 = clamp(128+48*items, 256, 1024)；low 档 p99×1.5 = 4608
+  check('autoBudget low/1 = 4864（答案预留下限 256）', autoBudget('low', 1) === 4864, String(autoBudget('low', 1)))
+  check('autoBudget low/30 = 5632（答案预留封顶 1024）', autoBudget('low', 30) === 5632, String(autoBudget('low', 30)))
+  check('autoBudget 认不出档位时按 AUTO_START', autoBudget('turbo', 5) === autoBudget(AUTO_START, 5), `${autoBudget('turbo', 5)}/${autoBudget(AUTO_START, 5)}`)
+  check('autoBudget 永不低于下限 4096', autoBudget('off', 0) === 4096, String(autoBudget('off', 0)))
+  check('autoBudget 永不超过上限 8000', autoBudget('high', 1000) === 8000, String(autoBudget('high', 1000)))
+}
+
+// 55. v7：显式 off 仍走「上游不认就退回不传」的老路径，而且算同一个槽（attempts=1）
+{
+  let attempt = 0
+  const llm = {
+    calls: [],
+    stream(options) {
+      this.calls.push(options)
+      attempt += 1
+      if (attempt === 1) {
+        return (async function* () {
+          throw new Error('上游 11133：模型不接受当前请求')
+        })()
+      }
+      return (async function* () {
+        yield { type: 'text-delta', index: 0, text: '1:yes 2:yes 3:yes' }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      })()
+    },
+  }
+  const audit = tmpFile('audit-explicit-off')
+  const h = checklistHarness(llm, { auditFile: audit, reasoningEffort: 'off' })
+  await h.stop()
+  const row = lastAuditRow(audit)
+  check('显式 off 被拒后第二次不传 effort', llm.calls[1]?.reasoningEffort === undefined, `effort=${llm.calls[1]?.reasoningEffort}`)
+  check('显式 off 的退回仍算槽 1（attempts=1）', row.attempts === 1, JSON.stringify(row))
+  check('显式 off 退回后照样判分', row.decision === 'pass', JSON.stringify(row))
+  h.cleanup()
+  fs.unlinkSync(audit)
+}
+
+// 56. v7：显式 off 没被拒但拿不到裁定 → 槽 2 才升到 minimal（尊重用户从 off 起手）
+{
+  let attempt = 0
+  const llm = {
+    calls: [],
+    stream(options) {
+      this.calls.push(options)
+      attempt += 1
+      const body = attempt === 1 ? '我不知道' : '1:yes 2:yes 3:yes'
+      return (async function* () {
+        yield { type: 'text-delta', index: 0, text: body }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      })()
+    },
+  }
+  const h = checklistHarness(llm, { reasoningEffort: 'off' })
+  await h.stop()
+  check('显式 off 的槽 2 升到 minimal', llm.calls[1]?.reasoningEffort === 'minimal', `effort=${llm.calls[1]?.reasoningEffort}`)
+  h.cleanup()
+}
+
+// 57. v7：活设置写 auto + judge.maxTokens=null → 走自动预算
+{
+  const settingsFile = `${process.env.TEMP ?? '/tmp'}/selfcheck-settings-auto-${Date.now()}.json`
+  const audit = tmpFile('audit-live-auto')
+  fs.writeFileSync(
+    settingsFile,
+    JSON.stringify(
+      {
+        enabled: true,
+        dryRun: false,
+        triggers: { minReplyChars: 0, maxReworks: 3, scoreThreshold: 70 },
+        judge: { timeoutMs: 60000, maxTokens: null, model: null },
+        criteria: [
+          { id: 'a', enabled: true, text: '结论放在最前面' },
+          { id: 'b', enabled: true, text: '说人话' },
+        ],
+        reasoningEffort: 'auto',
+        auditFile: audit,
+      },
+      null,
+      2,
+    ),
+    'utf8',
+  )
+  const llm = fakeLlm('1:yes 2:yes')
+  const h = harness({ dryRun: false, settingsFile, auditFile: audit }, llm, baseEvents)
+  await h.stop()
+  const row = lastAuditRow(audit)
+  check('活设置 auto 起手 low', llm.calls[0]?.reasoningEffort === 'low', `effort=${llm.calls[0]?.reasoningEffort}`)
+  check('活设置 maxTokens=null → 自动预算', llm.calls[0]?.maxTokens === autoBudget('low', 2), `budget=${llm.calls[0]?.maxTokens}`)
+  check('自动预算写进审计', row.maxTokens === autoBudget('low', 2), JSON.stringify(row))
+  fs.unlinkSync(audit)
+  fs.unlinkSync(settingsFile)
+}
+
+// 58. v7（修订 C）：活设置 null 不算「有数字」，仍然回落到 patch 的固定值
+//     （老挂载点里就写着 maxTokens: 4000；lead 部署时删掉它，删掉之后才走自动）
+{
+  const settingsFile = `${process.env.TEMP ?? '/tmp'}/selfcheck-settings-override-${Date.now()}.json`
+  const audit = tmpFile('audit-live-override')
+  fs.writeFileSync(
+    settingsFile,
+    JSON.stringify(
+      {
+        enabled: true,
+        dryRun: false,
+        triggers: { minReplyChars: 0, maxReworks: 3, scoreThreshold: 70 },
+        judge: { timeoutMs: 60000, maxTokens: null, model: null },
+        criteria: [
+          { id: 'a', enabled: true, text: '结论放在最前面' },
+          { id: 'b', enabled: true, text: '说人话' },
+        ],
+        auditFile: audit,
+      },
+      null,
+      2,
+    ),
+    'utf8',
+  )
+  const llm = fakeLlm('1:yes 2:yes')
+  const h = harness({ dryRun: false, settingsFile, auditFile: audit, maxTokens: 4000 }, llm, baseEvents)
+  await h.stop()
+  const row = lastAuditRow(audit)
+  check('活设置 null → 回落 patch 的 4000', llm.calls[0]?.maxTokens === 4000, `budget=${llm.calls[0]?.maxTokens}`)
+  check('回落固定值时 maxTokensAuto=false', row.maxTokensAuto === false, JSON.stringify(row))
+  fs.unlinkSync(audit)
+  fs.unlinkSync(settingsFile)
+}
+
+// 59. v7：活设置**没写** judge.maxTokens 时，回落到 patch 的固定值（老分层不变）
+{
+  const settingsFile = `${process.env.TEMP ?? '/tmp'}/selfcheck-settings-fallback-${Date.now()}.json`
+  const audit = tmpFile('audit-live-fallback')
+  fs.writeFileSync(
+    settingsFile,
+    JSON.stringify(
+      {
+        enabled: true,
+        dryRun: false,
+        triggers: { minReplyChars: 0, maxReworks: 3, scoreThreshold: 70 },
+        judge: { timeoutMs: 60000, model: null },
+        criteria: [
+          { id: 'a', enabled: true, text: '结论放在最前面' },
+          { id: 'b', enabled: true, text: '说人话' },
+        ],
+        auditFile: audit,
+      },
+      null,
+      2,
+    ),
+    'utf8',
+  )
+  const llm = fakeLlm('1:yes 2:yes')
+  const h = harness({ dryRun: false, settingsFile, auditFile: audit, maxTokens: 4000 }, llm, baseEvents)
+  await h.stop()
+  const row = lastAuditRow(audit)
+  check('活设置缺键 → 回落 patch 固定值', llm.calls[0]?.maxTokens === 4000, `budget=${llm.calls[0]?.maxTokens}`)
+  check('回落时 maxTokensAuto=false', row.maxTokensAuto === false, JSON.stringify(row))
+  fs.unlinkSync(audit)
+  fs.unlinkSync(settingsFile)
+}
+
+// 60. v7（修订 C）：活设置与 mount config 都没有 maxTokens → 自动预算，审计记 maxTokensAuto=true
+{
+  const settingsFile = `${process.env.TEMP ?? '/tmp'}/selfcheck-settings-nobudget-${Date.now()}.json`
+  const audit = tmpFile('audit-live-nobudget')
+  fs.writeFileSync(
+    settingsFile,
+    JSON.stringify(
+      {
+        enabled: true,
+        dryRun: false,
+        triggers: { minReplyChars: 0, maxReworks: 3, scoreThreshold: 70 },
+        judge: { timeoutMs: 60000, model: null },
+        criteria: [
+          { id: 'a', enabled: true, text: '结论放在最前面' },
+          { id: 'b', enabled: true, text: '说人话' },
+        ],
+        auditFile: audit,
+      },
+      null,
+      2,
+    ),
+    'utf8',
+  )
+  const llm = fakeLlm('1:yes 2:yes')
+  const h = harness({ dryRun: false, settingsFile, auditFile: audit }, llm, baseEvents)
+  await h.stop()
+  const row = lastAuditRow(audit)
+  check('两边都没有 → 自动预算', llm.calls[0]?.maxTokens === autoBudget('low', 2), `budget=${llm.calls[0]?.maxTokens}`)
+  check('自动预算审计 maxTokensAuto=true', row.maxTokensAuto === true, JSON.stringify(row))
+  fs.unlinkSync(audit)
+  fs.unlinkSync(settingsFile)
+}
+
+// 61. v7（修订 D）：两条打回文案都要求「不要复述这条提示」
+{
+  const hFail = harness({ dryRun: false }, fakeLlm('{"score": 30, "verdict": "fail"}'), baseEvents)
+  await hFail.stop()
+  const failText = String(hFail.steered[0]?.content?.[0]?.text ?? '')
+  check('fail 打回文案要求不复述提示', failText.includes('不用在回复里复述'), failText.slice(-30))
+
+  const hUnknown = harness({ dryRun: false }, fakeLlm('我不知道'), baseEvents)
+  await hUnknown.stop()
+  const unknownText = String(hUnknown.steered[0]?.content?.[0]?.text ?? '')
+  check('unknown 打回文案要求不复述提示', unknownText.includes('不用在回复里复述'), unknownText.slice(-30))
+}
+
+// 62. v1.3.1：档位被拒**也可能走 finish.failure 而不是 throw**
+//     实测：raccoon/sn-deepseek-v4-1-flash-1017 对 low 回 `does not support reasoning effort "low"`，
+//     judgeMs=0、textChars=0，抛都没抛。老版只接 throw，于是两槽都用被拒的档位各撞一次，
+//     最后 decision=unknown → onUnknown=rework，用户被白白打回三轮。
+{
+  let attempt = 0
+  const llm = {
+    calls: [],
+    stream(options) {
+      this.calls.push(options)
+      attempt += 1
+      if (attempt === 1) {
+        // 不抛错：把失败塞进 finish.reason.failure
+        return (async function* () {
+          yield { type: 'finish', reason: { kind: 'error', failure: { message: 'provider "raccoon" model "x" does not support reasoning effort "low"' } } }
+        })()
+      }
+      const text = '1:yes 2:yes 3:yes'
+      return (async function* () {
+        for (let i = 0; i < text.length; i += 40) yield { type: 'text-delta', text: text.slice(i, i + 40) }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      })()
+    },
+  }
+  const audit = tmpFile('audit-finish-refusal')
+  const h = checklistHarness(llm, { auditFile: audit })
+  await h.stop()
+  check('finish 里的档位拒绝也触发退回', llm.calls.length === 2, `calls=${llm.calls.length}`)
+  check('finish 拒绝退回后不传 effort', llm.calls[1]?.reasoningEffort === undefined, `effort=${llm.calls[1]?.reasoningEffort}`)
+  const row = lastAuditRow(audit)
+  check('finish 拒绝退回后仍正常判分（不再 unknown）', row.decision === 'pass' && row.score === 100, JSON.stringify(row))
+  check('finish 拒绝退回后 attempts=1', row.attempts === 1, `attempts=${row.attempts}`)
+  h.cleanup()
+  fs.unlinkSync(audit)
+}
+
+// 63. v1.3.1：finish 里是**真错误**（不是档位问题）时，不许把它当成档位拒绝而重复调用
+{
+  const llm = {
+    calls: [],
+    stream(options) {
+      this.calls.push(options)
+      return (async function* () {
+        yield { type: 'finish', reason: { kind: 'error', failure: { message: 'upstream 502 bad gateway' } } }
+      })()
+    },
+  }
+  const audit = tmpFile('audit-finish-real-error')
+  const h = checklistHarness(llm, { auditFile: audit })
+  await h.stop()
+  // 主判 + 补判＝2 次，不能因为误判成档位拒绝再多出第 3 次
+  check('finish 真错误不做档位退回（只有两槽）', llm.calls.length === 2, `calls=${llm.calls.length}`)
+  const row = lastAuditRow(audit)
+  check('finish 真错误仍走 unknown', row.decision === 'unknown', JSON.stringify(row))
+  check('finish 真错误审计 attempts=2', row.attempts === 2, `attempts=${row.attempts}`)
+  h.cleanup()
+  fs.unlinkSync(audit)
+}
+
+// 64. v1.3.1：路由级记忆——这个 provider/model 拒过档位，下一轮就别再白撞
+{
+  let refused = false
+  const llm = {
+    calls: [],
+    stream(options) {
+      this.calls.push(options)
+      if (!refused) {
+        refused = true
+        return (async function* () {
+          throw new Error('provider "raccoon" model "x" does not support reasoning effort "low"')
+        })()
+      }
+      const text = '1:yes 2:yes 3:yes'
+      return (async function* () {
+        for (let i = 0; i < text.length; i += 40) yield { type: 'text-delta', text: text.slice(i, i + 40) }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      })()
+    },
+  }
+  const audit = tmpFile('audit-route-memory')
+  const h = checklistHarness(llm, { auditFile: audit })
+  await h.stop(1)
+  const afterTurn1 = llm.calls.length
+  await h.stop(2)
+  const turn2 = llm.calls.slice(afterTurn1)
+  check('拒过档位的路由下一轮不再带 effort', turn2.every((call) => call.reasoningEffort === undefined), JSON.stringify(turn2.map((c) => c.reasoningEffort)))
+  check('下一轮只调一次上游（不再白撞+重试）', turn2.length === 1, `calls=${turn2.length}`)
+  h.cleanup()
+  fs.unlinkSync(audit)
 }
 
 console.log(`\n${passed} passed, ${failed} failed`)

@@ -9,9 +9,10 @@
   },
   "judge": {
     "timeoutMs": 60000,
-    "maxTokens": 4000,
     "model": null
   },
+  "onUnknown": "rework",
+  "reasoningEffort": "auto",
   "criteria": [
     {
       "id": "conclusion-first",
