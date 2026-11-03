@@ -108,6 +108,16 @@ window.__ModuleLoader__.load({
   border-radius: 8px; padding: 5px 9px; outline: none;
 }
 .qg-num:focus { border-color: var(--dsw-alias-state-business-primary); }
+.qg-select {
+  flex: none; min-width: 150px; max-width: 230px;
+  font-family: inherit; font-size: 13px;
+  color: var(--dsw-alias-label-primary);
+  background: var(--dsw-specific-input-major, var(--dsw-alias-bg-layer-2));
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 8px; padding: 5px 9px; outline: none; cursor: pointer;
+}
+.qg-select:focus { border-color: var(--dsw-alias-state-business-primary); }
+.qg-select:disabled { opacity: .5; cursor: default; }
 .qg-unit { flex: none; color: var(--dsw-alias-label-tertiary); font-size: 12px; width: 26px; }
 .qg-choice { flex: none; display: flex; gap: 6px; }
 .qg-choice-btn {
@@ -265,6 +275,10 @@ window.__ModuleLoader__.load({
       save: (settings) => request(`${API_ROOT}/settings`, { method: 'POST', body: JSON.stringify({ settings }) }),
       reset: () => request(`${API_ROOT}/reset`, { method: 'POST', body: '{}' }),
       restore: () => request(`${API_ROOT}/restore-backup`, { method: 'POST', body: '{}' }),
+      // v1.4.0 宿主新加的两个只读接口：可选模型清单、单个模型的思考档位。
+      models: () => request(`${API_ROOT}/models`),
+      modelInfo: (provider, model) =>
+        request(`${API_ROOT}/model-info?provider=${encodeURIComponent(provider)}&model=${encodeURIComponent(model)}`),
     }
 
     /** 把服务器给的设置拷成可编辑草稿：数字转字符串，免得输入中途被判成非法。 */
@@ -284,6 +298,7 @@ window.__ModuleLoader__.load({
         criteria: settings.criteria.map((item) => ({ ...item })),
         exceptions: settings.exceptions,
         onUnknown: settings.onUnknown === 'rework' ? 'rework' : 'pass',
+        reasoningEffort: settings.reasoningEffort ?? 'default',
       }
     }
 
@@ -320,9 +335,37 @@ window.__ModuleLoader__.load({
         criteria,
         exceptions: draft.exceptions,
         onUnknown: draft.onUnknown === 'rework' ? 'rework' : 'pass',
-        // v1.3.0：档位与输出预算由引擎自己定，面板只写 'auto'，不再收这两个输入框。
-        reasoningEffort: 'auto',
+        // v1.4.0：档位由人挑，'default' ＝ 一个字节都不发（老版本的 'auto' 已被归一到它）。
+        reasoningEffort: draft.reasoningEffort,
       }
+    }
+
+    /** 档位下拉的取值，跟 panel/lib/settings.js 的 EFFORT_VALUES 保持一致（这里不能 import）。 */
+    const EFFORT_OPTIONS = [
+      { value: 'default', label: '跟随该模型默认（不发送）' },
+      { value: 'off', label: 'off · 不思考' },
+      { value: 'minimal', label: 'minimal · 最低' },
+      { value: 'low', label: 'low · 低' },
+      { value: 'medium', label: 'medium · 中' },
+      { value: 'high', label: 'high · 高' },
+    ]
+
+    /** 宿主报了档位就只列它真支持的那几档；没报就退回全量六档。 */
+    function effortOptions(reported, current) {
+      const known = new Map(EFFORT_OPTIONS.map((option) => [option.value, option.label]))
+      const out = [EFFORT_OPTIONS[0]]
+      for (const effort of reported) {
+        if (!effort || effort.id === 'default') continue
+        out.push({
+          value: effort.id,
+          label: known.get(effort.id) || `${effort.id} · ${effort.name || effort.id}`,
+        })
+      }
+      // 当前设置里的档位不在这个模型报的范围内时也留一格，不然下拉会显示成空。
+      if (typeof current === 'string' && current !== 'default' && !out.some((option) => option.value === current)) {
+        out.push({ value: current, label: `${current}（当前设置，该模型没报这一档）` })
+      }
+      return out
     }
 
     const HELP = {
@@ -332,8 +375,9 @@ window.__ModuleLoader__.load({
       maxReworks: '同一条回复最多被打回几次，防死循环。0＝永不回炉。',
       scoreThreshold: '判官打分（0-100）低于这条线就算不过。',
       onUnknown: '判官两次都拿不到裁定（超时、断流、空输出）时怎么办。放行＝旧行为，风险是漏判；打回＝宁严不宽，会多花一轮。',
-      judgeAuto: '思考档位和输出预算由判官自己定：先用最省的档，判不出来才升级；预算随档位一起涨，保证答案不会被推理挤没。不用你填。',
-      timeoutMs: '判官超过这么久没回话就放弃，本条放行。',
+      judgeAuto: '默认一个字节都不发，让这家 API 用它自己的默认档；只有你想强行压低时才挑一档。输出上限固定 32768，不用填。',
+      judgeModel: '跟当前会话同一条线＝不指定，让判官走你正在用的那条模型；也可以从下拉里挑一个别的。',
+      timeoutMs: 'v1.4.0 起判官不再自己设截止，等上游回话为止。',
     }
 
     function Switch({ checked, onChange, disabled }) {
@@ -492,6 +536,10 @@ window.__ModuleLoader__.load({
       const [status, setStatus] = React.useState({ kind: 'loading', text: '读取中…' })
       const [error, setError] = React.useState('')
       const [saving, setSaving] = React.useState(false)
+      /** v1.4.0：宿主给的模型目录。null ＝还在读；读到了但 available=false ＝退回手填。 */
+      const [catalog, setCatalog] = React.useState(null)
+      /** 当前选中的那个模型自己报出来的思考档位；空数组＝没报、或还没问出来。 */
+      const [efforts, setEfforts] = React.useState([])
 
       const load = React.useCallback(async () => {
         setStatus({ kind: 'loading', text: '读取中…' })
@@ -504,6 +552,14 @@ window.__ModuleLoader__.load({
         } catch (cause) {
           setStatus({ kind: 'bad', text: '读不到设置' })
           setError(String((cause && cause.message) || cause))
+        }
+        // 模型目录单独走：它挂了也不能影响设置本身显示，所以放在 try 外面、自己兜底。
+        try {
+          const body = await api.models()
+          const list = body && Array.isArray(body.providers) ? body.providers : []
+          setCatalog({ available: body && body.available === true, providers: list })
+        } catch {
+          setCatalog({ available: false, providers: [] })
         }
       }, [])
 
@@ -569,6 +625,33 @@ window.__ModuleLoader__.load({
         }
       }, [])
 
+      const selectedProvider =
+        draft === null || draft.judge.model === null || draft.judge.model === undefined ? '' : draft.judge.model.provider
+      const selectedModel =
+        draft === null || draft.judge.model === null || draft.judge.model === undefined ? '' : draft.judge.model.model
+
+      // 选中 provider+model 之后问一次「这个模型自己报了哪些档位」，供档位下拉收窄用。
+      React.useEffect(() => {
+        if (selectedProvider === '' || selectedModel === '') {
+          setEfforts([])
+          return undefined
+        }
+        let alive = true
+        api
+          .modelInfo(selectedProvider, selectedModel)
+          .then((body) => {
+            if (!alive) return
+            const list = body && Array.isArray(body.efforts) ? body.efforts : []
+            setEfforts(list.filter((effort) => effort && typeof effort.id === 'string' && effort.id !== ''))
+          })
+          .catch(() => {
+            if (alive) setEfforts([])
+          })
+        return () => {
+          alive = false
+        }
+      }, [selectedProvider, selectedModel])
+
       if (draft === null) {
         return h(
           'div',
@@ -585,6 +668,27 @@ window.__ModuleLoader__.load({
       const engines = state && state.engines
       const audit = (state && state.audit) || []
       const files = (state && state.files) || null
+
+      // 模型下拉的数据面：宿主没给 llm 服务（或整包读失败）就退回手填，绝不让面板炸掉。
+      const providerList = catalog && Array.isArray(catalog.providers) ? catalog.providers : []
+      const manualModel = catalog !== null && (catalog.available !== true || providerList.length === 0)
+      const providerModels =
+        (providerList.find((provider) => provider.id === selectedProvider) || { models: [] }).models || []
+      const providerOptions = [{ value: '', label: '跟当前会话同一条线' }].concat(
+        providerList.map((provider) => ({ value: provider.id, label: provider.name || provider.id })),
+      )
+      const modelOptions = [{ value: '', label: selectedProvider === '' ? '先选上面那条线' : '选一个模型' }].concat(
+        providerModels.map((model) => ({ value: model.id, label: model.name || model.id })),
+      )
+      // 手填/旧配置里的 provider、model 可能不在宿主报的清单里 —— 补一格，不然下拉会显示成空。
+      if (selectedProvider !== '' && !providerOptions.some((option) => option.value === selectedProvider)) {
+        providerOptions.push({ value: selectedProvider, label: `${selectedProvider}（当前设置，宿主没报这条线）` })
+      }
+      if (selectedModel !== '' && !modelOptions.some((option) => option.value === selectedModel)) {
+        modelOptions.push({ value: selectedModel, label: `${selectedModel}（当前设置，宿主没报这个型号）` })
+      }
+      const effortChoices =
+        efforts.length === 0 ? EFFORT_OPTIONS : effortOptions(efforts, draft.reasoningEffort)
 
       return h(
         'div',
@@ -737,26 +841,44 @@ window.__ModuleLoader__.load({
             'section',
             { className: 'qg-section' },
             h('header', null, h('h2', null, '判官这台机器'), h('span', null, '一般不用动')),
-            h(NumberRow, {
-              title: '超时',
-              help: HELP.timeoutMs,
-              value: draft.judge.timeoutMs,
-              min: 1000,
-              max: 120000,
-              unit: 'ms',
-              onChange: (value) => patchDraft((next) => { next.judge.timeoutMs = value }),
-            }),
-            // v1.3.0：档位和输出预算改由插件自动定，面板只留一行说明（不再让人手填）。
+            // v1.4.0：超时已停用（引擎里那段 setTimeout 删了），这里只留一行说明。
             h(
               'div',
               { className: 'qg-row' },
               h(
                 'div',
                 { className: 'qg-row-main' },
-                h('div', { className: 'qg-row-title' }, '思考档位 / 输出预算'),
-                h('div', { className: 'qg-row-help' }, HELP.judgeAuto),
+                h('div', { className: 'qg-row-title' }, '超时'),
+                h('div', { className: 'qg-row-help' }, HELP.timeoutMs),
               ),
-              h('span', { className: 'qg-unit', style: { width: 'auto' } }, '自动'),
+              h('span', { className: 'qg-unit', style: { width: 'auto' } }, '已停用'),
+            ),
+            // v1.4.0：档位改由人挑；默认那一档＝一个字节都不发。
+            h(
+              'div',
+              { className: 'qg-row' },
+              h(
+                'div',
+                { className: 'qg-row-main' },
+                h('div', { className: 'qg-row-title' }, '思考档位'),
+                h('div', { className: 'qg-row-help' }, HELP.judgeAuto),
+                efforts.length === 0
+                  ? null
+                  : h(
+                      'div',
+                      { className: 'qg-row-help' },
+                      `这个模型自己报的支持：${efforts.map((effort) => effort.name || effort.id).join(' / ')}`,
+                    ),
+              ),
+              h(
+                'select',
+                {
+                  className: 'qg-select',
+                  value: draft.reasoningEffort,
+                  onChange: (event) => patchDraft((next) => { next.reasoningEffort = event.target.value }),
+                },
+                effortChoices.map((option) => h('option', { key: option.value, value: option.value }, option.label)),
+              ),
             ),
             h(ChoiceRow, {
               title: '判官拿不到裁定时',
@@ -775,32 +897,80 @@ window.__ModuleLoader__.load({
                 'div',
                 { className: 'qg-row-main' },
                 h('div', { className: 'qg-row-title' }, '判官模型'),
-                h('div', { className: 'qg-row-help' }, '留空＝跟当前会话同一条模型线。要指定就填 provider 和 model。'),
+                h('div', { className: 'qg-row-help' }, HELP.judgeModel),
+                manualModel ? h('div', { className: 'qg-row-help' }, '宿主没给模型列表，只能手填。') : null,
               ),
-              h('input', {
-                className: 'qg-num',
-                style: { width: '190px', textAlign: 'left' },
-                placeholder: 'provider',
-                value: draft.judge.model ? draft.judge.model.provider : '',
-                onChange: (event) =>
-                  patchDraft((next) => {
-                    const provider = event.target.value
-                    const model = next.judge.model ? next.judge.model.model : ''
-                    next.judge.model = provider === '' && model === '' ? null : { provider, model }
-                  }),
-              }),
-              h('input', {
-                className: 'qg-num',
-                style: { width: '190px', textAlign: 'left' },
-                placeholder: 'model',
-                value: draft.judge.model ? draft.judge.model.model : '',
-                onChange: (event) =>
-                  patchDraft((next) => {
-                    const model = event.target.value
-                    const provider = next.judge.model ? next.judge.model.provider : ''
-                    next.judge.model = provider === '' && model === '' ? null : { provider, model }
-                  }),
-              }),
+              manualModel
+                ? h(
+                    'div',
+                    { className: 'qg-choice' },
+                    h('input', {
+                      className: 'qg-num',
+                      style: { width: '150px', textAlign: 'left' },
+                      placeholder: 'provider',
+                      value: selectedProvider,
+                      onChange: (event) =>
+                        patchDraft((next) => {
+                          const provider = event.target.value
+                          const model = next.judge.model ? next.judge.model.model : ''
+                          next.judge.model = provider === '' && model === '' ? null : { provider, model }
+                        }),
+                    }),
+                    h('input', {
+                      className: 'qg-num',
+                      style: { width: '150px', textAlign: 'left' },
+                      placeholder: 'model',
+                      value: selectedModel,
+                      onChange: (event) =>
+                        patchDraft((next) => {
+                          const model = event.target.value
+                          const provider = next.judge.model ? next.judge.model.provider : ''
+                          next.judge.model = provider === '' && model === '' ? null : { provider, model }
+                        }),
+                    }),
+                  )
+                : h(
+                    'div',
+                    { className: 'qg-choice' },
+                    h(
+                      'select',
+                      {
+                        className: 'qg-select',
+                        style: { width: '170px' },
+                        value: selectedProvider,
+                        onChange: (event) => {
+                          const provider = event.target.value
+                          patchDraft((next) => {
+                            // 换 provider 就把 model 清空，免得留下一个对面根本没有的型号。
+                            next.judge.model = provider === '' ? null : { provider, model: '' }
+                          })
+                        },
+                      },
+                      providerOptions.map((option) =>
+                        h('option', { key: option.value, value: option.value }, option.label),
+                      ),
+                    ),
+                    h(
+                      'select',
+                      {
+                        className: 'qg-select',
+                        style: { width: '170px' },
+                        value: selectedModel,
+                        disabled: selectedProvider === '',
+                        onChange: (event) => {
+                          const model = event.target.value
+                          patchDraft((next) => {
+                            if (model === '') {
+                              next.judge.model = null
+                              return
+                            }
+                            next.judge.model = { provider: selectedProvider, model }
+                          })
+                        },
+                      },
+                      modelOptions.map((option) => h('option', { key: option.value, value: option.value }, option.label)),
+                    ),
+                  ),
             ),
           ),
 

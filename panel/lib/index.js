@@ -167,6 +167,82 @@ function sendJson(res, status, payload) {
   res.end(body)
 }
 
+/**
+ * 当前 scoped fiber 的 llm 服务（v1.4.0 新增给面板填模型用）。
+ *
+ * 为什么**每次请求现取**而不是 apply 时就抓好：
+ *   `llm` 是宿主后挂的服务，apply 那一刻它可能还没就绪；而 `ctx.inject(['llm'], …)` 在依赖缺失时
+ *   **整块回调都不会跑**——把 webServer 一起拖死，面板会整个 404。所以 webServer 单独 inject，
+ *   llm 每次请求时 try 一次，拿不到就老实回 available:false，面板退回手填。
+ */
+let serviceScope = null
+
+function resolveLlm() {
+  try {
+    const llm = serviceScope?.get?.('llm') ?? serviceScope?.llm
+    return typeof llm?.stream === 'function' ? llm : null
+  } catch {
+    return null
+  }
+}
+
+/** 把 llm.listProviders() / listModels() 收成面板能直接渲染的下拉数据。 */
+async function modelsPayload() {
+  const llm = resolveLlm()
+  if (llm === null) return { ok: true, available: false, providers: [] }
+  let providers = []
+  try {
+    providers = typeof llm.listProviders === 'function' ? llm.listProviders() : []
+  } catch {
+    return { ok: true, available: false, providers: [] }
+  }
+  const out = []
+  for (const provider of Array.isArray(providers) ? providers : []) {
+    const id = typeof provider?.id === 'string' ? provider.id : ''
+    if (id === '') continue
+    let models = []
+    try {
+      models = typeof llm.listModels === 'function' ? await llm.listModels(id) : []
+    } catch {
+      models = []
+    }
+    out.push({
+      id,
+      name: typeof provider?.name === 'string' && provider.name !== '' ? provider.name : id,
+      models: (Array.isArray(models) ? models : []).map((model) => ({
+        id: typeof model?.id === 'string' ? model.id : '',
+        name: typeof model?.name === 'string' && model.name !== '' ? model.name : (typeof model?.id === 'string' ? model.id : ''),
+      })).filter((model) => model.id !== ''),
+    })
+  }
+  return { ok: true, available: out.length > 0, providers: out }
+}
+
+/** 单个模型支持哪些思考档位 —— 直接问宿主，绝不在插件里猜。 */
+async function modelInfoPayload(provider, model) {
+  const llm = resolveLlm()
+  if (llm === null || provider === '' || model === '') {
+    return { ok: true, available: false, efforts: [], defaultEffort: null }
+  }
+  if (typeof llm.resolveModelInfo !== 'function') return { ok: true, available: false, efforts: [], defaultEffort: null }
+  try {
+    const info = await llm.resolveModelInfo(provider, model)
+    const reasoning = info?.reasoning
+    const efforts = Array.isArray(reasoning?.efforts) ? reasoning.efforts : []
+    return {
+      ok: true,
+      available: efforts.length > 0,
+      efforts: efforts.map((effort) => ({
+        id: typeof effort?.id === 'string' ? effort.id : '',
+        name: typeof effort?.name === 'string' && effort.name !== '' ? effort.name : (typeof effort?.id === 'string' ? effort.id : ''),
+      })).filter((effort) => effort.id !== ''),
+      defaultEffort: typeof reasoning?.defaultEffort === 'string' ? reasoning.defaultEffort : null,
+    }
+  } catch (error) {
+    return { ok: true, available: false, efforts: [], defaultEffort: null, note: String((error && error.message) || error) }
+  }
+}
+
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = []
@@ -225,6 +301,16 @@ async function handle(req, res) {
     if (req.method === 'GET' && route === '/audit') {
       const limit = Math.min(Math.max(Number(url.searchParams.get('limit') ?? 30) || 30, 1), 200)
       sendJson(res, 200, { ok: true, audit: readAudit(limit) })
+      return
+    }
+    if (req.method === 'GET' && route === '/models') {
+      sendJson(res, 200, await modelsPayload())
+      return
+    }
+    if (req.method === 'GET' && route === '/model-info') {
+      const provider = String(url.searchParams.get('provider') ?? '').trim()
+      const model = String(url.searchParams.get('model') ?? '').trim()
+      sendJson(res, 200, await modelInfoPayload(provider, model))
       return
     }
     if (req.method === 'POST' && route === '/settings') {
@@ -300,11 +386,13 @@ export function apply(ctx) {
 
   if (direct) {
     logHost('ctx.webServer 直接可用')
+    serviceScope = ctx
     mount(ctx, 'ctx')
     return
   }
   logHost('ctx.webServer 没拿到 → 改用 ctx.inject 现开 scoped fiber')
   ctx.inject(['webServer'], (scoped) => {
+    serviceScope = scoped
     logHost(`scoped 就绪，scoped.webServer=${typeof (scoped && scoped.webServer)}`)
     mount(scoped, 'scoped')
   })

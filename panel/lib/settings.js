@@ -66,21 +66,24 @@ export function defaults() {
     enabled: true,
     dryRun: true,
     triggers: { minReplyChars: 0, maxReworks: 3, scoreThreshold: 70 },
-    // v1.3.0 起判官最多能输出多少 token 由引擎按思考档位自动算，面板不再收这一项。
-    // 超时保持 60s：20s 时有过「abort 后一个字都没吐」，而 abort 在 SDK 里不报 error，引擎看不出来。
-    judge: { timeoutMs: 60000, model: null },
+    // v1.4.0：超时不再由插件自己截（引擎里那段 setTimeout 已删），这个键只为兼容老 patch 保留。
+    judge: { timeoutMs: 60000, maxTokens: null, model: null },
     // 判官两次都拿不到裁定时的出口（v5 三值逻辑的 unknown）：
     // 'pass' ＝ 放行（旧行为，风险是漏判）；'rework' ＝ 打回重写（宁严不宽，v1.3.0 起为默认）。
     onUnknown: 'rework',
-    // 判官的思考档位（v6）。'auto' ＝ 引擎自己定：先用最省的档，判不出来才升级，预算随档位一起涨。
-    // 实测判官 91% 的输出字符花在推理上，手填档位很容易把答案挤没，所以 v1.3.0 起面板不再让用户选。
-    reasoningEffort: 'auto',
+    // 判官的思考档位（v1.4.0）。'default' ＝ 一个字节都不发，让该 provider/model 用它自己的默认档。
+    // 发档位是 v1.2~v1.3 的病根：本机 10 次「不认识这个档位」被拒、升档 7 次成功 0 次。
+    // 仍然允许显式填 off/minimal/low/medium/high —— 那是给「想强制低思考省钱」的人留的开关。
+    reasoningEffort: 'default',
     criteria: DEFAULT_CRITERIA.map((item) => ({ ...item })),
     exceptions: DEFAULT_EXCEPTIONS,
     auditFile: AUDIT_FILE.replace(/\\/g, '/'),
     updatedAt: null,
   }
 }
+
+/** 引擎认的档位值；'auto' 是老别名的残留，归一到 'default'。 */
+export const EFFORT_VALUES = ['default', 'off', 'minimal', 'low', 'medium', 'high']
 
 /** 字段说明：面板用它渲染「这一项在管什么」，引擎不看。 */
 export const FIELD_HELP = {
@@ -89,9 +92,9 @@ export const FIELD_HELP = {
   minReplyChars: '回复短于这个字数就跳过检查。0＝每条都查（连「好的」也查）。',
   maxReworks: '同一条回复最多被打回几次，防死循环。0＝永不回炉。',
   scoreThreshold: '判官打分的及格线（0-100）。低于它就算不过。',
-  onUnknown: '判官两次都拿不到裁定（超时、断流、空输出）时怎么办。放行＝旧行为，风险是漏判；打回＝宁严不宽，会多花一轮。v1.3.0 起默认打回。',
-  reasoningEffort: '判官思考多深、最多能输出多少 token——这两项由判官自己定。先用最省的档，判不出来才升级；预算随档位一起涨，保证答案不会被推理挤没。面板上不用你填。',
-  timeoutMs: '判官超过这么久没回话就放弃，本条放行。',
+  onUnknown: '判官两次都拿不到裁定（断流、空输出、上游 502）时怎么办。放行＝旧行为，风险是漏判；打回＝宁严不宽，会多花一轮。v1.3.0 起默认打回。',
+  reasoningEffort: '留「跟随模型默认」＝一个字节都不发，由这家 API 自己决定用多深的思考。只有你想强行压低思考成本时才挑一个具体档位。',
+  timeoutMs: '已停用：v1.4.0 起判官不再自己设截止，等上游回话为止。',
   criteria: '判官手里那张尺子。勾掉＝这一条不再检查。',
   exceptions: '例外情形：写在这里的，判官不按上面的判据算违规。一行一条。',
 }
@@ -170,6 +173,17 @@ export function normalize(input) {
     ? input.auditFile.trim()
     : base.auditFile
 
+  // maxTokens 只为兼容老 patch / 老 settings.json 而保留：v1.4.0 起引擎固定发 JUDGE_MAX_TOKENS(32768)，
+  // 这里仍收一个数字当逃生舱（有人想故意压小来省钱的话，引擎照用）。
+  const maxTokens = judge.maxTokens === undefined || judge.maxTokens === null
+    ? null
+    : pickInt(judge.maxTokens, '判官输出上限', null, 64, 32768)
+
+  const rawEffort = typeof input.reasoningEffort === 'string' ? input.reasoningEffort.trim() : ''
+  const reasoningEffort = rawEffort === 'auto' || rawEffort === ''
+    ? 'default'
+    : EFFORT_VALUES.includes(rawEffort) ? rawEffort : base.reasoningEffort
+
   return {
     version: 1,
     enabled: pickBool(input.enabled, '总开关', base.enabled),
@@ -181,13 +195,14 @@ export function normalize(input) {
     },
     judge: {
       timeoutMs: pickInt(judge.timeoutMs, '判官超时', base.judge.timeoutMs, 1000, 120000),
+      maxTokens,
       model,
     },
     criteria,
     exceptions: exceptions.trim(),
     onUnknown: input.onUnknown === 'rework' ? 'rework' : input.onUnknown === 'pass' ? 'pass' : base.onUnknown,
-    // v1.3.0：档位与输出预算由引擎自己定，面板只写 'auto'（旧文件里的 low/high 等值保存时一并归一）。
-    reasoningEffort: 'auto',
+    // v1.4.0：默认 'default'＝一个字节都不发档位；'auto' 是老别名，归一过来。
+    reasoningEffort,
     auditFile: auditFile.replace(/\\/g, '/'),
     updatedAt: typeof input.updatedAt === 'string' ? input.updatedAt : null,
   }

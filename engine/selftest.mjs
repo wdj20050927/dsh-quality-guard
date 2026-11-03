@@ -6,7 +6,7 @@
  */
 
 import fs from 'node:fs'
-import { apply, name, autoBudget, AUTO_START } from './index.mjs'
+import { apply, name, JUDGE_MAX_TOKENS, AUTO_START } from './index.mjs'
 
 let passed = 0
 let failed = 0
@@ -235,7 +235,7 @@ console.log(`${name} selftest`)
   await h.stop()
   check('非法输出则放行', h.steered.length === 0)
   check('非法输出会补判一次', llm.calls.length === 2, `calls=${llm.calls.length}`)
-  check('补判的提示是更短的清单版', String(llm.calls[1]?.messages?.[0]?.content?.[0]?.text ?? '').includes('只输出这一行判定结果'))
+  check('补判的提示是更短的一行版', String(llm.calls[1]?.messages?.[0]?.content?.[0]?.text ?? '').includes('只输出这一行得分'))
 }
 
 // 9. 没有路由 → 不调用，只 warn 一次
@@ -579,23 +579,29 @@ console.log(`${name} selftest`)
 }
 
 /**
- * v6：清单模式。
+ * v1.4.0：逐条 0-10 打分模式。
  *
- * 背景（实测，见 `.scratch/probe-judge-*.mjs`）：让判官给「0-100 一个整数」，
- * 同一段回复连判 9 次得 40/1/2/20/20/20/30/25/55（range 54），还会自作主张换成 `SCORE: 2/10`。
- * 改成逐条 yes/no 后同一批用例 range 0~11。这一组守的就是「别再退回打分模式」。
+ * 背景（实测，见 `.scratch/probe-judge-*.mjs` 与 `probe-score10-out.txt`）：
+ *  - 让判官给「0-100 一个整数」：同一段回复连判 9 次得 40/1/2/20/20/20/30/25/55（range 54），
+ *    还会自作主张换成 `SCORE: 2/10`。
+ *  - 改成逐条 yes/no：range 0~11，但判据表里「人设」「结论量化打分」这类在技术问答里
+ *    根本没有判定对象的条目永远判 no，把本该 100 分的回复压到 60/40/24（audit 358 行实测）。
+ *  - 加第三态 na：能修上面的病，但用户否了——「用户随时会去调整质检词，你不知道哪几条要打分、
+ *    哪几条要 yes/no」，于是**每条判据都拿一个 0-10 的分**，「客观加不了」写进提示词打 10 分。
+ *    实测 good/mid/bad 各 4 次，总分极差 8/6/5，好 76~88、坏 35~42，分得开。
+ * 这一组守的就是「逐条打分 + 分母恒等于条数 + 第 1 条硬门槛」这三条规矩。
  */
-const CHECKLIST_CRITERIA = [
+const SCORE_CRITERIA = [
   '判据（任一条不满足即不合格）：',
   '1. 最核心的那一条放在最前面直接给出。',
   '2. 用最简单最直白的话说。',
   '3. 不旁生枝节。',
 ].join('\n')
 
-/** 写一份只有 3 条编号判据的临时文件（清单模式要靠编号才启用）。 */
+/** 写一份只有 3 条编号判据的临时文件（逐条打分要靠编号才启用）。 */
 const checklistCriteriaFile = () => {
   const file = `${process.env.TEMP ?? '/tmp'}/selfcheck-criteria-${Date.now()}-${Math.random().toString(36).slice(2)}.md`
-  fs.writeFileSync(file, CHECKLIST_CRITERIA, 'utf8')
+  fs.writeFileSync(file, SCORE_CRITERIA, 'utf8')
   return file
 }
 
@@ -606,102 +612,126 @@ const checklistHarness = (llm, config = {}) => {
   return h
 }
 
-// 33. 清单模式：全 yes → 100 分 pass，且走的是 checklist 分支
+// 33. 逐条打分：全 10 → 100 分 pass，且走的是 scores 分支
 {
-  const audit = tmpFile('audit-cl-all')
-  const h = checklistHarness(fakeLlm('1:yes 2:yes 3:yes\nFIX: 无需改动'), { auditFile: audit })
+  const audit = tmpFile('audit-sc-all')
+  const h = checklistHarness(fakeLlm('1:10 2:10 3:10\nFIX: 无需改动'), { auditFile: audit })
   await h.stop()
   const row = lastAuditRow(audit)
-  check('清单全 yes 记 100 分', row.score === 100, JSON.stringify(row))
-  check('清单全 yes 判 pass', row.decision === 'pass', JSON.stringify(row))
-  check('清单模式 scoreSource=checklist', row.scoreSource === 'checklist', JSON.stringify(row))
-  check('清单模式不回炉', h.steered.length === 0, `steered=${h.steered.length}`)
+  check('全 10 分记 100 分', row.score === 100, JSON.stringify(row))
+  check('全 10 分判 pass', row.decision === 'pass', JSON.stringify(row))
+  check('逐条打分 scoreSource=scores', row.scoreSource === 'scores', JSON.stringify(row))
+  check('逐条打分不回炉', h.steered.length === 0, `steered=${h.steered.length}`)
+  check(
+    'checks 记的是分数而不是 yes/no',
+    Array.isArray(row.checks) && row.checks.length === 3 && row.checks[0]?.score === 10 && row.checks[0]?.ok === undefined,
+    JSON.stringify(row.checks),
+  )
   h.cleanup()
   fs.unlinkSync(audit)
 }
 
-// 34. 清单模式：第 1 条 no 是硬门槛，满分只按 59 折算
+// 34. 逐条打分：第 1 条低于 6 分是硬门槛，满分只按 59 折算
+//     `1:2 2:10 3:10` → sum=22 → rate=22/30 → round(0.7333*59)=43
 {
-  const audit = tmpFile('audit-cl-gate')
-  const h = checklistHarness(fakeLlm('1:no 2:yes 3:yes\nFIX: 开头直接给结论'), { auditFile: audit })
+  const audit = tmpFile('audit-sc-gate')
+  const h = checklistHarness(fakeLlm('1:2 2:10 3:10\nFIX: 开头直接给结论'), { auditFile: audit })
   await h.stop()
   const row = lastAuditRow(audit)
-  check('第 1 条不过则分数按 59 折算', row.score === 39, `score=${row.score}`)
-  check('第 1 条不过就判 fail', row.decision === 'fail', JSON.stringify(row))
-  check('第 1 条不过真回炉', h.steered.length === 1, `steered=${h.steered.length}`)
-  check('回炉文案点名是哪一条', String(h.steered[0]?.content?.[0]?.text ?? '').includes('最核心的那一条'), String(h.steered[0]?.content?.[0]?.text ?? ''))
+  check('第 1 条低于 6 分则按 59 折算（43 分）', row.score === 43, `score=${row.score}`)
+  check('第 1 条低于 6 分就判 fail', row.decision === 'fail', JSON.stringify(row))
+  check('第 1 条低于 6 分真回炉', h.steered.length === 1, `steered=${h.steered.length}`)
+  const steered = String(h.steered[0]?.content?.[0]?.text ?? '')
+  check('回炉文案点名是哪一条', steered.includes('最核心的那一条'), steered)
+  check('回炉文案带上实际得分', steered.includes('2/10'), steered)
   h.cleanup()
   fs.unlinkSync(audit)
 }
 
-// 35. 清单模式：第 2、3 条 no → 33 分 fail
+// 35. 逐条打分：非第 1 条失分**不再**直接打回——只要折算分数够就 pass
+//     这是与 yes/no 时代最大的语义差别：以前「任一条 no 即 fail」，判据表里只要有
+//     一条永远拿不到满分的风格项（人设/量化打分），80 分的回复照样被打回。
+//     `1:10 2:5 3:10` → sum=25 → 83 分 pass，但 worst 仍要点名第 2 条。
 {
-  const audit = tmpFile('audit-cl-partial')
-  const h = checklistHarness(fakeLlm('1:yes 2:no 3:no\nFIX: 说人话'), { auditFile: audit })
+  const audit = tmpFile('audit-sc-partial')
+  const h = checklistHarness(fakeLlm('1:10 2:5 3:10\nFIX: 说人话'), { auditFile: audit })
   await h.stop()
   const row = lastAuditRow(audit)
-  check('清单部分不过按比例折算', row.score === 33, `score=${row.score}`)
-  check('清单部分不过判 fail', row.decision === 'fail', JSON.stringify(row))
+  check('非第 1 条失分按比例折算（83 分）', row.score === 83, `score=${row.score}`)
+  check('非第 1 条失分不再直接打回', row.decision === 'pass', JSON.stringify(row))
+  check('失分的条目仍写进 worst 备查', String(row.worst ?? '').includes('第 2 条'), String(row.worst))
+  check('够分就不回炉', h.steered.length === 0, `steered=${h.steered.length}`)
   h.cleanup()
   fs.unlinkSync(audit)
 }
 
-// 36. 清单模式：答漏编号时，已答出来的部分照样算分（只要第 1 条在）
+// 36. 逐条打分：答漏编号时分母恒等于条数（漏答按 0 分压着，不白送分）
+//     `1:10 2:10`（漏 3）→ sum=20 → rate=20/30 → 67 分
 {
-  const audit = tmpFile('audit-cl-missing')
-  const h = checklistHarness(fakeLlm('1:yes 2:yes'), { auditFile: audit })
+  const audit = tmpFile('audit-sc-missing')
+  const h = checklistHarness(fakeLlm('1:10 2:10'), { auditFile: audit })
   await h.stop()
   const row = lastAuditRow(audit)
-  check('答漏编号仍按已答部分算分', row.score === 67, `score=${row.score}`)
-  check('答漏编号会记下漏了哪几条', Array.isArray(row.incomplete) && row.incomplete.includes(3), JSON.stringify(row.incomplete))
+  check('漏答不让分母变小（67 分）', row.score === 67, `score=${row.score}`)
+  check('漏答会记下漏了哪几条', Array.isArray(row.incomplete) && row.incomplete.includes(3), JSON.stringify(row.incomplete))
+  check('漏答判 fail', row.decision === 'fail', JSON.stringify(row))
   h.cleanup()
   fs.unlinkSync(audit)
 }
 
-// 37. 清单模式：判官改口吐老格式 JSON，也认（要的是裁定，不是格式）
+// 37. 逐条打分模式：判官改口吐老格式 JSON，也认（要的是裁定，不是格式）
 {
   const audit = tmpFile('audit-cl-json')
   const h = harness({ dryRun: false, auditFile: audit }, fakeLlm({ score: 88, verdict: 'pass' }), baseEvents)
   await h.stop()
   const row = lastAuditRow(audit)
-  check('清单模式里老 JSON 也认', row.score === 88, JSON.stringify(row))
-  check('清单模式里老 JSON 记 scoreSource=json', row.scoreSource === 'json', JSON.stringify(row))
+  check('逐条打分里老 JSON 也认', row.score === 88, JSON.stringify(row))
+  check('逐条打分里老 JSON 记 scoreSource=json', row.scoreSource === 'json', JSON.stringify(row))
   fs.unlinkSync(audit)
 }
 
-// 38. 清单模式：判官只吐老格式 `SCORE: 30` 也认
+// 38. 逐条打分模式：判官只吐老格式 `SCORE: 30` 也认
 {
   const audit = tmpFile('audit-cl-score')
   const h = harness({ dryRun: false, auditFile: audit }, fakeLlm('SCORE: 30'), baseEvents)
   await h.stop()
   const row = lastAuditRow(audit)
-  check('清单模式里 SCORE 行也认', row.score === 30, JSON.stringify(row))
-  check('清单模式里 SCORE 行判 fail', row.decision === 'fail', JSON.stringify(row))
+  check('逐条打分里 SCORE 行也认', row.score === 30, JSON.stringify(row))
+  check('逐条打分里 SCORE 行判 fail', row.decision === 'fail', JSON.stringify(row))
   fs.unlinkSync(audit)
 }
 
-// 39. 清单模式：提示里必须把编号列出来，且要求一条不漏
+// 39. 逐条打分：提示里必须把编号列出来，且要求一条不漏、分数放第一行
 {
-  const llm = fakeLlm('1:yes 2:yes 3:yes')
+  const llm = fakeLlm('1:10 2:10 3:10')
   const h = harness({ dryRun: false }, llm, baseEvents)
   await h.stop()
   const prompt = String(llm.calls[0]?.messages?.[0]?.content?.[0]?.text ?? '')
-  check('清单提示带全部编号', prompt.includes('1:yes') && prompt.includes('3:yes'), prompt.slice(0, 200))
-  check('清单提示要求一条不漏', prompt.includes('一条都不许漏'))
-  check('清单提示把判定放第一行', prompt.includes('第一行必须是全部判定结果'))
+  check('打分提示带全部编号', prompt.includes('1:8') && prompt.includes('3:10'), prompt.slice(0, 300))
+  check('打分提示要求一条不漏', prompt.includes('一条都不许漏'))
+  check('打分提示把得分放第一行', prompt.includes('第一行必须是全部得分'))
+  check('打分提示带锚点量表', prompt.includes('10 分：完全做到') && prompt.includes('0 分：明确违反'), prompt.slice(0, 300))
+  check(
+    '打分提示写死「客观加不了→10」',
+    prompt.includes('客观加不了') && prompt.includes('这种情况打 **10**'),
+    prompt.slice(0, 300),
+  )
+  check('打分提示禁止第 1 条走客观加不了', prompt.includes('第 1 条永远有判定对象'), prompt.slice(0, 300))
+  check('打分提示里的示例第 1 条不是满分（防橡皮图章）', !prompt.includes('例如：1:10'), prompt.slice(-320))
 }
 
-// 40. v6：判官必须显式传 reasoningEffort（不传就继承 profile 的 high，token 全被推理吃掉）
+// 40. v1.4.0：判官默认**不传** reasoningEffort（v6 的「必须显式传 low」已被生产数据推翻）
+//     不传＝继承该 provider/model 自己的默认档，谁是 low / 谁叫别的名字都不会炸。
 {
-  const llm = fakeLlm('1:yes 2:yes 3:yes')
+  const llm = fakeLlm('1:10 2:10 3:10')
   const h = harness({ dryRun: false }, llm, baseEvents)
   await h.stop()
-  check('判官显式传 reasoningEffort', llm.calls[0]?.reasoningEffort === 'low', `effort=${llm.calls[0]?.reasoningEffort}`)
+  check('判官默认不传 reasoningEffort', llm.calls[0]?.reasoningEffort === undefined, `effort=${llm.calls[0]?.reasoningEffort}`)
 }
 
 // 41. v6：reasoningEffort 可配，配成 high 就传 high
 {
-  const llm = fakeLlm('1:yes 2:yes 3:yes')
+  const llm = fakeLlm('1:10 2:10 3:10')
   const h = harness({ dryRun: false, reasoningEffort: 'high' }, llm, baseEvents)
   await h.stop()
   check('reasoningEffort 可配成 high', llm.calls[0]?.reasoningEffort === 'high', `effort=${llm.calls[0]?.reasoningEffort}`)
@@ -711,7 +741,7 @@ const checklistHarness = (llm, config = {}) => {
 {
   let threw
   try {
-    harness({ reasoningEffort: 'turbo' }, fakeLlm('1:yes'), baseEvents)
+    harness({ reasoningEffort: 'turbo' }, fakeLlm('1:10'), baseEvents)
   } catch (error) {
     threw = error
   }
@@ -731,7 +761,7 @@ const checklistHarness = (llm, config = {}) => {
           throw new Error('pi-ai provider "workbuddy" model "x" does not support reasoning effort "low"')
         })()
       }
-      const text = '1:yes 2:yes 3:yes'
+      const text = '1:10 2:10 3:10'
       return (async function* () {
         for (let i = 0; i < text.length; i += 40) yield { type: 'text-delta', text: text.slice(i, i + 40) }
         yield { type: 'finish', reason: { kind: 'stop' } }
@@ -739,7 +769,7 @@ const checklistHarness = (llm, config = {}) => {
     },
   }
   const audit = tmpFile('audit-effort-fallback')
-  const h = checklistHarness(llm, { auditFile: audit })
+  const h = checklistHarness(llm, { auditFile: audit, reasoningEffort: 'low' })
   await h.stop()
   check('档位被拒后重试一次', llm.calls.length === 2, `calls=${llm.calls.length}`)
   check('档位被拒后第二次不传 effort', llm.calls[1]?.reasoningEffort === undefined, `effort=${llm.calls[1]?.reasoningEffort}`)
@@ -762,27 +792,27 @@ const checklistHarness = (llm, config = {}) => {
           throw new Error('上游 11133：模型不接受当前请求')
         })()
       }
-      const text = '1:yes 2:yes 3:yes'
+      const text = '1:10 2:10 3:10'
       return (async function* () {
         for (let i = 0; i < text.length; i += 40) yield { type: 'text-delta', text: text.slice(i, i + 40) }
         yield { type: 'finish', reason: { kind: 'stop' } }
       })()
     },
   }
-  const h = harness({ dryRun: false }, llm, baseEvents)
+  const h = harness({ dryRun: false, reasoningEffort: 'low' }, llm, baseEvents)
   await h.stop()
   check('上游 11133 也触发退回', llm.calls.length === 2, `calls=${llm.calls.length}`)
   check('上游 11133 退回后不传 effort', llm.calls[1]?.reasoningEffort === undefined, `effort=${llm.calls[1]?.reasoningEffort}`)
 }
 
-// 45. v6/v7：真错误（不是档位问题）不许被当成「档位不支持」而丢掉 effort；槽 2 还要升一级
+// 45. v1.4.0：真错误（不是档位问题）不许被当成「档位不支持」而丢掉 effort；槽 2 也不换档
 {
   const llm = fakeLlm(new Error('upstream 502 bad gateway'))
   const audit = tmpFile('audit-effort-real-error')
-  const h = harness({ dryRun: false, auditFile: audit }, llm, baseEvents)
+  const h = harness({ dryRun: false, auditFile: audit, reasoningEffort: 'low' }, llm, baseEvents)
   await h.stop()
-  // 两次调用＝一次主判 + 一次补判；关键是两次都还带着 effort（low→medium 是升档，不是丢失）。
-  check('真错误两槽都保留 effort（low,medium）', llm.calls.map((call) => call.reasoningEffort).join(',') === 'low,medium', llm.calls.map((call) => call.reasoningEffort).join(','))
+  // 两次调用＝一次主判 + 一次补判；关键是两次都还带着用户显式选的档位（不升档、不丢失）。
+  check('真错误两槽都保留 effort（low,low）', llm.calls.map((call) => call.reasoningEffort).join(',') === 'low,low', llm.calls.map((call) => call.reasoningEffort).join(','))
   const row = lastAuditRow(audit)
   check('真错误走 unknown 出口', row.decision === 'unknown', JSON.stringify(row))
   check('真错误审计记 attempts=2', row.attempts === 2, JSON.stringify(row))
@@ -792,13 +822,13 @@ const checklistHarness = (llm, config = {}) => {
 {
   const audit = tmpFile('audit-cl-trunc')
   const chunks = [
-    { type: 'text-delta', text: '1:no 2:yes 3:yes\nFIX: 开头直接给结' },
+    { type: 'text-delta', text: '1:2 2:10 3:10\nFIX: 开头直接给结' },
     { type: 'finish', reason: { kind: 'max-tokens' } },
   ]
   const h = checklistHarness(fakeLlmChunks(chunks), { auditFile: audit })
   await h.stop()
   const row = lastAuditRow(audit)
-  check('截断的清单仍能判分', row.score === 39, JSON.stringify(row))
+  check('截断的分数行仍能判分', row.score === 43, JSON.stringify(row))
   check('截断的清单仍判 fail', row.decision === 'fail', JSON.stringify(row))
   check('截断的清单不记 error', row.error === undefined, JSON.stringify(row.error))
   h.cleanup()
@@ -846,7 +876,7 @@ const checklistHarness = (llm, config = {}) => {
     ),
     'utf8',
   )
-  const llm = fakeLlm('1:yes 2:yes')
+  const llm = fakeLlm('1:10 2:10')
   const h = harness({ dryRun: false, settingsFile, auditFile: audit }, llm, baseEvents)
   await h.stop()
   check('活设置顶层 reasoningEffort 生效', llm.calls[0]?.reasoningEffort === 'minimal', `effort=${llm.calls[0]?.reasoningEffort}`)
@@ -857,31 +887,34 @@ const checklistHarness = (llm, config = {}) => {
 }
 
 /**
- * ── v7（契约 v1.3.0）：判官档位与输出预算全部自动化 ────────────────────────────
+ * ── v1.4.0（契约 v1.4.0）：判官不再猜档位、不再自设截止、预算固定 32768 ──────────
  *
- * 背景（生产审计实测）：11 条 `judge returned no JSON` 的 reasonChars 最高 4614、答案均 210 字符
- * ＝ 4000 的预算被推理吃光；judgeMs 最大 12442ms，远没到 timeoutMs 60000
- * ＝ 该升档的时候只是拿同一个档位原地重问一遍。
+ * 依据（生产审计 336 行）：
+ *  - `attempts=2` 共 7 行、**成功 0 行**，全部是被 provider 拒掉的 `medium`
+ *    （`does not support reasoning effort "medium"`）→ 升档那一半从来没救回过东西。
+ *  - v1.3 起 reasonChars p90 2440 字符、最坏 3448 字符 ≈ 2369 token，占 4976 的 48%，
+ *    一次都没逼近过上限 → 「够不够」没有调参的必要，直接封顶。
+ *  - 本机唯一两次成功的调用（`raccoon` 60 分、`qodercn/gfmodel` 100 分）都是**不发档位**。
  */
 
-// 49. v7：档位默认 auto，起手档就是导出常量 AUTO_START
+// 49. v1.4.0：默认**不发送**任何档位
 {
-  const llm = fakeLlm('1:yes 2:yes 3:yes')
+  const llm = fakeLlm('1:10 2:10 3:10')
   const h = harness({ dryRun: false }, llm, baseEvents)
   await h.stop()
-  check('AUTO_START 是 low（契约 v1.3.0）', AUTO_START === 'low', AUTO_START)
-  check('默认 auto 从 AUTO_START 起手', llm.calls[0]?.reasoningEffort === AUTO_START, `effort=${llm.calls[0]?.reasoningEffort}`)
+  check('AUTO_START 是 default（＝不发档位）', AUTO_START === 'default', AUTO_START)
+  check('默认不发送 reasoningEffort', llm.calls[0]?.reasoningEffort === undefined, `effort=${llm.calls[0]?.reasoningEffort}`)
 }
 
-// 50. v7：显式写 'auto' 与不写等价
+// 50. v1.4.0：旧值 'auto' 与不写等价，都收敛到「不发」
 {
-  const llm = fakeLlm('1:yes 2:yes 3:yes')
+  const llm = fakeLlm('1:10 2:10 3:10')
   const h = harness({ dryRun: false, reasoningEffort: 'auto' }, llm, baseEvents)
   await h.stop()
-  check('显式 auto 起手 low', llm.calls[0]?.reasoningEffort === 'low', `effort=${llm.calls[0]?.reasoningEffort}`)
+  check('显式 auto 也不发档位', llm.calls[0]?.reasoningEffort === undefined, `effort=${llm.calls[0]?.reasoningEffort}`)
 }
 
-// 51. v7：槽 2 升一级，且预算按新档位重算（自动预算下 medium 比 low 多 2048）
+// 51. v1.4.0：槽 2 不换档、不换预算，只是同参数 + 更短提示再问一次
 {
   let attempt = 0
   const llm = {
@@ -889,68 +922,65 @@ const checklistHarness = (llm, config = {}) => {
     stream(options) {
       this.calls.push(options)
       attempt += 1
-      const body = attempt === 1 ? '我先想想……' : '1:yes 2:yes 3:yes'
+      const body = attempt === 1 ? '我先想想……' : '1:10 2:10 3:10'
       return (async function* () {
         yield { type: 'text-delta', index: 0, text: body }
         yield { type: 'finish', reason: { kind: 'stop' } }
       })()
     },
   }
-  const audit = tmpFile('audit-slot-upgrade')
+  const audit = tmpFile('audit-slot-same')
   const h = checklistHarness(llm, { auditFile: audit })
   await h.stop()
   const row = lastAuditRow(audit)
-  check('槽 1 起手 low', llm.calls[0]?.reasoningEffort === 'low', `effort=${llm.calls[0]?.reasoningEffort}`)
-  check('槽 2 升到 medium', llm.calls[1]?.reasoningEffort === 'medium', `effort=${llm.calls[1]?.reasoningEffort}`)
-  check('槽 1 预算按 low 算', llm.calls[0]?.maxTokens === autoBudget('low', 3), `budget=${llm.calls[0]?.maxTokens}`)
-  check('槽 2 预算按 medium 重算', llm.calls[1]?.maxTokens === autoBudget('medium', 3), `budget=${llm.calls[1]?.maxTokens}`)
-  check('槽 2 预算真的比槽 1 大', llm.calls[1]?.maxTokens > llm.calls[0]?.maxTokens, `${llm.calls[0]?.maxTokens} -> ${llm.calls[1]?.maxTokens}`)
+  check('槽 1 不发档位', llm.calls[0]?.reasoningEffort === undefined, `effort=${llm.calls[0]?.reasoningEffort}`)
+  check('槽 2 也不发档位（不升档）', llm.calls[1]?.reasoningEffort === undefined, `effort=${llm.calls[1]?.reasoningEffort}`)
+  check('两槽预算相同', llm.calls[0]?.maxTokens === llm.calls[1]?.maxTokens, `${llm.calls[0]?.maxTokens} vs ${llm.calls[1]?.maxTokens}`)
+  check('两槽预算都是 JUDGE_MAX_TOKENS', llm.calls[0]?.maxTokens === JUDGE_MAX_TOKENS, `budget=${llm.calls[0]?.maxTokens}`)
   check('审计记 attempts=2', row.attempts === 2, JSON.stringify(row))
-  check('审计记实到的档位 medium', row.effort === 'medium', JSON.stringify(row))
-  check('审计记实际用的 maxTokens', row.maxTokens === autoBudget('medium', 3), JSON.stringify(row))
+  check('审计 effort 记 default', row.effort === 'default', JSON.stringify(row))
+  check('审计 maxTokens 记 32768', row.maxTokens === JUDGE_MAX_TOKENS, JSON.stringify(row))
   h.cleanup()
   fs.unlinkSync(audit)
 }
 
-// 52. v7：到顶不再升（显式 high 时槽 2 还是 high）
+// 52. v1.4.0：显式选了档位 → 两槽都用它，不再升一级
 {
   const llm = fakeLlm(new Error('upstream 502 bad gateway'))
   const h = harness({ dryRun: false, onUnknown: 'pass', reasoningEffort: 'high' }, llm, baseEvents)
   await h.stop()
-  check('high 到顶不越界', llm.calls.map((call) => call.reasoningEffort).join(',') === 'high,high', llm.calls.map((call) => call.reasoningEffort).join(','))
+  check(
+    '显式 high 两槽都是 high（不升档）',
+    llm.calls.map((call) => call.reasoningEffort).join(',') === 'high,high',
+    llm.calls.map((call) => call.reasoningEffort).join(','),
+  )
 }
 
-// 53. v7：显式 maxTokens 仍是逃生舱 —— 两槽都用这个数字，不做自动预算
+// 53. v1.4.0：显式 maxTokens 仍是逃生舱
 {
-  const llm = fakeLlm('1:yes 2:yes 3:yes')
+  const llm = fakeLlm('1:10 2:10 3:10')
   const audit = tmpFile('audit-fixed-tokens')
   const h = checklistHarness(llm, { auditFile: audit, maxTokens: 900 })
   await h.stop()
   const row = lastAuditRow(audit)
   check('显式 maxTokens 照用', llm.calls[0]?.maxTokens === 900, `budget=${llm.calls[0]?.maxTokens}`)
   check('显式 maxTokens 写进审计', row.maxTokens === 900, JSON.stringify(row))
-  check('显式 maxTokens 不改起手档', llm.calls[0]?.reasoningEffort === 'low', `effort=${llm.calls[0]?.reasoningEffort}`)
+  check('显式 maxTokens 不改档位', llm.calls[0]?.reasoningEffort === undefined, `effort=${llm.calls[0]?.reasoningEffort}`)
   h.cleanup()
   fs.unlinkSync(audit)
 }
 
-// 54. v7（修订 A）：autoBudget = clamp(round(p99×1.5) + 答案预留, 4096, 8000)
+// 54. v1.4.0：JUDGE_MAX_TOKENS 就是 32768（中继 Math.min 之后能拿到的最大值）
 {
-  // 契约钉死的五个点（items=5 时）：off/minimal 被 4096 兜住，low 4976、medium 6512、high 被 8000 兜住
-  check('autoBudget off/5 = 4096（下限兜底）', autoBudget('off', 5) === 4096, String(autoBudget('off', 5)))
-  check('autoBudget minimal/5 = 4096（下限兜底）', autoBudget('minimal', 5) === 4096, String(autoBudget('minimal', 5)))
-  check('autoBudget low/5 = 4976', autoBudget('low', 5) === 4976, String(autoBudget('low', 5)))
-  check('autoBudget medium/5 = 6512', autoBudget('medium', 5) === 6512, String(autoBudget('medium', 5)))
-  check('autoBudget high/5 = 8000（上限封顶）', autoBudget('high', 5) === 8000, String(autoBudget('high', 5)))
-  // 答案预留 = clamp(128+48*items, 256, 1024)；low 档 p99×1.5 = 4608
-  check('autoBudget low/1 = 4864（答案预留下限 256）', autoBudget('low', 1) === 4864, String(autoBudget('low', 1)))
-  check('autoBudget low/30 = 5632（答案预留封顶 1024）', autoBudget('low', 30) === 5632, String(autoBudget('low', 30)))
-  check('autoBudget 认不出档位时按 AUTO_START', autoBudget('turbo', 5) === autoBudget(AUTO_START, 5), `${autoBudget('turbo', 5)}/${autoBudget(AUTO_START, 5)}`)
-  check('autoBudget 永不低于下限 4096', autoBudget('off', 0) === 4096, String(autoBudget('off', 0)))
-  check('autoBudget 永不超过上限 8000', autoBudget('high', 1000) === 8000, String(autoBudget('high', 1000)))
+  check('JUDGE_MAX_TOKENS = 32768', JUDGE_MAX_TOKENS === 32768, String(JUDGE_MAX_TOKENS))
+  const llm = fakeLlm('1:10 2:10 3:10')
+  const h = checklistHarness(llm, {})
+  await h.stop()
+  check('默认预算就是 32768', llm.calls[0]?.maxTokens === 32768, `budget=${llm.calls[0]?.maxTokens}`)
+  h.cleanup()
 }
 
-// 55. v7：显式 off 仍走「上游不认就退回不传」的老路径，而且算同一个槽（attempts=1）
+// 55. v1.4.0：显式 off 仍走「上游不认就退回不传」的老路径，而且算同一个槽（attempts=1）
 {
   let attempt = 0
   const llm = {
@@ -964,7 +994,7 @@ const checklistHarness = (llm, config = {}) => {
         })()
       }
       return (async function* () {
-        yield { type: 'text-delta', index: 0, text: '1:yes 2:yes 3:yes' }
+        yield { type: 'text-delta', index: 0, text: '1:10 2:10 3:10' }
         yield { type: 'finish', reason: { kind: 'stop' } }
       })()
     },
@@ -973,6 +1003,7 @@ const checklistHarness = (llm, config = {}) => {
   const h = checklistHarness(llm, { auditFile: audit, reasoningEffort: 'off' })
   await h.stop()
   const row = lastAuditRow(audit)
+  check('显式 off 第一次确实发了', llm.calls[0]?.reasoningEffort === 'off', `effort=${llm.calls[0]?.reasoningEffort}`)
   check('显式 off 被拒后第二次不传 effort', llm.calls[1]?.reasoningEffort === undefined, `effort=${llm.calls[1]?.reasoningEffort}`)
   check('显式 off 的退回仍算槽 1（attempts=1）', row.attempts === 1, JSON.stringify(row))
   check('显式 off 退回后照样判分', row.decision === 'pass', JSON.stringify(row))
@@ -980,7 +1011,7 @@ const checklistHarness = (llm, config = {}) => {
   fs.unlinkSync(audit)
 }
 
-// 56. v7：显式 off 没被拒但拿不到裁定 → 槽 2 才升到 minimal（尊重用户从 off 起手）
+// 56. v1.4.0：显式 off 没被拒但拿不到裁定 → 槽 2 仍是 off（不换档）
 {
   let attempt = 0
   const llm = {
@@ -988,7 +1019,7 @@ const checklistHarness = (llm, config = {}) => {
     stream(options) {
       this.calls.push(options)
       attempt += 1
-      const body = attempt === 1 ? '我不知道' : '1:yes 2:yes 3:yes'
+      const body = attempt === 1 ? '我不知道' : '1:10 2:10 3:10'
       return (async function* () {
         yield { type: 'text-delta', index: 0, text: body }
         yield { type: 'finish', reason: { kind: 'stop' } }
@@ -997,11 +1028,11 @@ const checklistHarness = (llm, config = {}) => {
   }
   const h = checklistHarness(llm, { reasoningEffort: 'off' })
   await h.stop()
-  check('显式 off 的槽 2 升到 minimal', llm.calls[1]?.reasoningEffort === 'minimal', `effort=${llm.calls[1]?.reasoningEffort}`)
+  check('显式 off 的槽 2 还是 off', llm.calls[1]?.reasoningEffort === 'off', `effort=${llm.calls[1]?.reasoningEffort}`)
   h.cleanup()
 }
 
-// 57. v7：活设置写 auto + judge.maxTokens=null → 走自动预算
+// 57. v1.4.0：活设置写 auto + judge.maxTokens=null → 不发档位、预算 32768
 {
   const settingsFile = `${process.env.TEMP ?? '/tmp'}/selfcheck-settings-auto-${Date.now()}.json`
   const audit = tmpFile('audit-live-auto')
@@ -1025,13 +1056,13 @@ const checklistHarness = (llm, config = {}) => {
     ),
     'utf8',
   )
-  const llm = fakeLlm('1:yes 2:yes')
+  const llm = fakeLlm('1:10 2:10')
   const h = harness({ dryRun: false, settingsFile, auditFile: audit }, llm, baseEvents)
   await h.stop()
   const row = lastAuditRow(audit)
-  check('活设置 auto 起手 low', llm.calls[0]?.reasoningEffort === 'low', `effort=${llm.calls[0]?.reasoningEffort}`)
-  check('活设置 maxTokens=null → 自动预算', llm.calls[0]?.maxTokens === autoBudget('low', 2), `budget=${llm.calls[0]?.maxTokens}`)
-  check('自动预算写进审计', row.maxTokens === autoBudget('low', 2), JSON.stringify(row))
+  check('活设置 auto → 不发档位', llm.calls[0]?.reasoningEffort === undefined, `effort=${llm.calls[0]?.reasoningEffort}`)
+  check('活设置 maxTokens=null → 预算 32768', llm.calls[0]?.maxTokens === JUDGE_MAX_TOKENS, `budget=${llm.calls[0]?.maxTokens}`)
+  check('预算 32768 写进审计', row.maxTokens === JUDGE_MAX_TOKENS, JSON.stringify(row))
   fs.unlinkSync(audit)
   fs.unlinkSync(settingsFile)
 }
@@ -1060,7 +1091,7 @@ const checklistHarness = (llm, config = {}) => {
     ),
     'utf8',
   )
-  const llm = fakeLlm('1:yes 2:yes')
+  const llm = fakeLlm('1:10 2:10')
   const h = harness({ dryRun: false, settingsFile, auditFile: audit, maxTokens: 4000 }, llm, baseEvents)
   await h.stop()
   const row = lastAuditRow(audit)
@@ -1093,7 +1124,7 @@ const checklistHarness = (llm, config = {}) => {
     ),
     'utf8',
   )
-  const llm = fakeLlm('1:yes 2:yes')
+  const llm = fakeLlm('1:10 2:10')
   const h = harness({ dryRun: false, settingsFile, auditFile: audit, maxTokens: 4000 }, llm, baseEvents)
   await h.stop()
   const row = lastAuditRow(audit)
@@ -1103,7 +1134,7 @@ const checklistHarness = (llm, config = {}) => {
   fs.unlinkSync(settingsFile)
 }
 
-// 60. v7（修订 C）：活设置与 mount config 都没有 maxTokens → 自动预算，审计记 maxTokensAuto=true
+// 60. v1.4.0：活设置与 mount config 都没有 maxTokens → 固定 32768，审计记 maxTokensAuto=false
 {
   const settingsFile = `${process.env.TEMP ?? '/tmp'}/selfcheck-settings-nobudget-${Date.now()}.json`
   const audit = tmpFile('audit-live-nobudget')
@@ -1126,12 +1157,12 @@ const checklistHarness = (llm, config = {}) => {
     ),
     'utf8',
   )
-  const llm = fakeLlm('1:yes 2:yes')
+  const llm = fakeLlm('1:10 2:10')
   const h = harness({ dryRun: false, settingsFile, auditFile: audit }, llm, baseEvents)
   await h.stop()
   const row = lastAuditRow(audit)
-  check('两边都没有 → 自动预算', llm.calls[0]?.maxTokens === autoBudget('low', 2), `budget=${llm.calls[0]?.maxTokens}`)
-  check('自动预算审计 maxTokensAuto=true', row.maxTokensAuto === true, JSON.stringify(row))
+  check('两边都没有 → 预算 32768', llm.calls[0]?.maxTokens === JUDGE_MAX_TOKENS, `budget=${llm.calls[0]?.maxTokens}`)
+  check('固定预算审计 maxTokensAuto=false', row.maxTokensAuto === false, JSON.stringify(row))
   fs.unlinkSync(audit)
   fs.unlinkSync(settingsFile)
 }
@@ -1166,7 +1197,7 @@ const checklistHarness = (llm, config = {}) => {
           yield { type: 'finish', reason: { kind: 'error', failure: { message: 'provider "raccoon" model "x" does not support reasoning effort "low"' } } }
         })()
       }
-      const text = '1:yes 2:yes 3:yes'
+      const text = '1:10 2:10 3:10'
       return (async function* () {
         for (let i = 0; i < text.length; i += 40) yield { type: 'text-delta', text: text.slice(i, i + 40) }
         yield { type: 'finish', reason: { kind: 'stop' } }
@@ -1174,7 +1205,8 @@ const checklistHarness = (llm, config = {}) => {
     },
   }
   const audit = tmpFile('audit-finish-refusal')
-  const h = checklistHarness(llm, { auditFile: audit })
+  // v1.4.0 默认不发档位，要复现「档位被拒」必须显式选一个档
+  const h = checklistHarness(llm, { auditFile: audit, reasoningEffort: 'low' })
   await h.stop()
   check('finish 里的档位拒绝也触发退回', llm.calls.length === 2, `calls=${llm.calls.length}`)
   check('finish 拒绝退回后不传 effort', llm.calls[1]?.reasoningEffort === undefined, `effort=${llm.calls[1]?.reasoningEffort}`)
@@ -1221,7 +1253,7 @@ const checklistHarness = (llm, config = {}) => {
           throw new Error('provider "raccoon" model "x" does not support reasoning effort "low"')
         })()
       }
-      const text = '1:yes 2:yes 3:yes'
+      const text = '1:10 2:10 3:10'
       return (async function* () {
         for (let i = 0; i < text.length; i += 40) yield { type: 'text-delta', text: text.slice(i, i + 40) }
         yield { type: 'finish', reason: { kind: 'stop' } }
@@ -1229,13 +1261,140 @@ const checklistHarness = (llm, config = {}) => {
     },
   }
   const audit = tmpFile('audit-route-memory')
-  const h = checklistHarness(llm, { auditFile: audit })
+  // v1.4.0 默认不发档位，要复现「拒过档位的路由」必须显式选一个档
+  const h = checklistHarness(llm, { auditFile: audit, reasoningEffort: 'low' })
   await h.stop(1)
   const afterTurn1 = llm.calls.length
   await h.stop(2)
   const turn2 = llm.calls.slice(afterTurn1)
   check('拒过档位的路由下一轮不再带 effort', turn2.every((call) => call.reasoningEffort === undefined), JSON.stringify(turn2.map((c) => c.reasoningEffort)))
   check('下一轮只调一次上游（不再白撞+重试）', turn2.length === 1, `calls=${turn2.length}`)
+  h.cleanup()
+  fs.unlinkSync(audit)
+}
+
+// ── v1.4.0：逐条 0-10 打分 ──────────────────────────────────────────────
+// 背景：judge 走过「逐条 yes/no」。判据表里有条目在技术问答里**没有判定对象**
+// （「保持某某人设」「结论要量化打分」），这些条一律判 no，分母又恒等于条数，
+// 把本该 100 分的回复压到 60/40/24。实测 audit.jsonl 358 行 / 63 行带 checks：
+// ④ no 20 次、⑤ no 18 次，只有 4/5 挂的 17 行本该 100，其中 8 行真被打回（占 24 次打回的 33%）。
+// 先加过第三态 na，但用户否了（「用户随时会去调整质检词，你不知道哪几条要打分」），
+// 于是改成**每条都给一个 0-10 的分**，「客观加不了」写进提示词算 10 分。
+
+// 65. 一条扣分但总体够分 → pass（yes/no 时代这里会被判 fail）
+{
+  const audit = tmpFile('audit-sc-partial-pass')
+  const h = checklistHarness(fakeLlm('1:10 2:10 3:4\nFIX: 别旁生枝节'), { auditFile: audit })
+  await h.stop()
+  const row = lastAuditRow(audit)
+  check('一条 4 分其余满分 → 80 分', row.score === 80, `score=${row.score}`)
+  check('80 分判 pass（不再「任一条扣分即 fail」）', row.decision === 'pass', JSON.stringify(row))
+  check('失分条目写进 worst', String(row.worst ?? '').includes('第 3 条'), String(row.worst))
+  check('worst 带上实际得分', String(row.worst ?? '').includes('4/10'), String(row.worst))
+  check('不回炉', h.steered.length === 0, `steered=${h.steered.length}`)
+  h.cleanup()
+  fs.unlinkSync(audit)
+}
+
+// 66. 越界分（判官写 100）当未答，绝不当成满分
+{
+  const audit = tmpFile('audit-sc-range')
+  const h = checklistHarness(fakeLlm('1:10 2:100 3:10'), { auditFile: audit })
+  await h.stop()
+  const row = lastAuditRow(audit)
+  check('越界分按未答处理（67 分）', row.score === 67, `score=${row.score}`)
+  check('越界分判 fail', row.decision === 'fail', JSON.stringify(row))
+  check('越界分记进 incomplete', Array.isArray(row.incomplete) && row.incomplete.includes(2), JSON.stringify(row.incomplete))
+  check('越界分不写进 checks', row.checks?.[1]?.score === undefined, JSON.stringify(row.checks))
+  h.cleanup()
+  fs.unlinkSync(audit)
+}
+
+// 67. 判官一种分数都没给 → 走三层抢救，抢救不到按 unknown（不瞎猜分数）
+{
+  const audit = tmpFile('audit-sc-none')
+  const h = checklistHarness(fakeLlm('我觉得还行吧'), { auditFile: audit })
+  await h.stop()
+  const row = lastAuditRow(audit)
+  check('一个分数都没有 → unknown', row.decision === 'unknown', JSON.stringify(row))
+  check('一个分数都没有 → 审计不记 score', row.score === undefined, JSON.stringify(row))
+  h.cleanup()
+  fs.unlinkSync(audit)
+}
+
+// 68. 分数写法容错：`8/10`、全角冒号、逗号分隔、`2. 9`
+{
+  const audit = tmpFile('audit-sc-format')
+  const h = checklistHarness(fakeLlm('1：8，2. 9，3:10'), { auditFile: audit })
+  await h.stop()
+  const row = lastAuditRow(audit)
+  check('全角冒号/逗号/点号都认', row.score === 90, `score=${row.score}`)
+  h.cleanup()
+  fs.unlinkSync(audit)
+
+  const audit2 = tmpFile('audit-sc-slash')
+  const h2 = checklistHarness(fakeLlm('1:10 2:8/10 3:10'), { auditFile: audit2 })
+  await h2.stop()
+  const row2 = lastAuditRow(audit2)
+  check('`8/10` 这种写法也认（93 分）', row2.score === 93, `score=${row2.score}`)
+  h2.cleanup()
+  fs.unlinkSync(audit2)
+}
+
+// 69. 第 1 条 4 分（<6）→ 满分按 59 折算：sum=24 → round(0.8*59)=47
+{
+  const audit = tmpFile('audit-sc-gate-4')
+  const h = checklistHarness(fakeLlm('1:4 2:10 3:10\nFIX: 开头直接给结论'), { auditFile: audit })
+  await h.stop()
+  const row = lastAuditRow(audit)
+  check('第 1 条 4 分 → 47 分', row.score === 47, `score=${row.score}`)
+  check('第 1 条 4 分 → fail', row.decision === 'fail', JSON.stringify(row))
+  check('第 1 条 4 分 → 回炉', h.steered.length === 1, `steered=${h.steered.length}`)
+  h.cleanup()
+  fs.unlinkSync(audit)
+}
+
+// 70. 每条都 6 分（无一条低于 6）→ 不触发硬门槛，就是 60 分 fail
+{
+  const audit = tmpFile('audit-sc-flat')
+  const h = checklistHarness(fakeLlm('1:6 2:6 3:6\nFIX: 全都要改'), { auditFile: audit })
+  await h.stop()
+  const row = lastAuditRow(audit)
+  check('全 6 分 → 60 分', row.score === 60, `score=${row.score}`)
+  check('全 6 分 → fail（低于及格线 70）', row.decision === 'fail', JSON.stringify(row))
+  check('没有低于 6 的条目时 worst 为空（硬门槛没触发）', row.worst === '', String(row.worst))
+  h.cleanup()
+  fs.unlinkSync(audit)
+}
+
+// 71. 分数写在一行里，截断只吃掉尾巴——截断仍能判分
+{
+  const audit = tmpFile('audit-sc-trunc')
+  const chunks = [
+    { type: 'text-delta', text: '1:2 2:10 3:10\nFIX: 开头直接给结' },
+    { type: 'finish', reason: { kind: 'max-tokens' } },
+  ]
+  const h = checklistHarness(fakeLlmChunks(chunks), { auditFile: audit })
+  await h.stop()
+  const row = lastAuditRow(audit)
+  check('截断的分数行仍能判分（43）', row.score === 43, JSON.stringify(row))
+  check('截断仍记 scoreSource=scores', row.scoreSource === 'scores', JSON.stringify(row))
+  check('截断不记 error', row.error === undefined, JSON.stringify(row.error))
+  h.cleanup()
+  fs.unlinkSync(audit)
+}
+
+// 72. 审计里 checks 是分数数组，且跟 worst 对得上（事后能复盘「这条为什么扣分」）
+{
+  const audit = tmpFile('audit-sc-checks')
+  const h = checklistHarness(fakeLlm('1:10 2:3 3:10'), { auditFile: audit })
+  await h.stop()
+  const row = lastAuditRow(audit)
+  check('checks 三条齐全', Array.isArray(row.checks) && row.checks.length === 3, JSON.stringify(row.checks))
+  check('checks 记的是 0-10 分数', JSON.stringify(row.checks.map((entry) => entry.score)) === '[10,3,10]', JSON.stringify(row.checks))
+  check('checks 带判据 id（就是判据里的编号）', JSON.stringify(row.checks.map((entry) => entry.id)) === '[1,2,3]', JSON.stringify(row.checks))
+  check('checks 与 worst 一致（第 2 条 3/10）', String(row.worst ?? '').includes('第 2 条只拿到 3/10'), String(row.worst))
+  check('审计不再有 na 字段', row.naCount === undefined && row.applicable === undefined && row.naSuspicious === undefined, JSON.stringify(row))
   h.cleanup()
   fs.unlinkSync(audit)
 }
