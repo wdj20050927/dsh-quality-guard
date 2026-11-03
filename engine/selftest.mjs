@@ -648,19 +648,32 @@ const checklistHarness = (llm, config = {}) => {
   fs.unlinkSync(audit)
 }
 
-// 35. 逐条打分：非第 1 条失分**不再**直接打回——只要折算分数够就 pass
-//     这是与 yes/no 时代最大的语义差别：以前「任一条 no 即 fail」，判据表里只要有
-//     一条永远拿不到满分的风格项（人设/量化打分），80 分的回复照样被打回。
-//     `1:10 2:5 3:10` → sum=25 → 83 分 pass，但 worst 仍要点名第 2 条。
+// 35. 逐条打分：**任一条**低于 6 分都直接打回（v1.5.0 起，不再只认第 1 条）
+//     用户原话：「你现在这个给分太宽泛了，谁都可以踢一脚，怎么行」——
+//     五条判据必须条条能一票否决，否则等于五条建议。
+//     `1:10 2:5 3:10` → sum=25 → 一条低于 6 → round(25/30*59)=49 分，fail。
 {
   const audit = tmpFile('audit-sc-partial')
   const h = checklistHarness(fakeLlm('1:10 2:5 3:10\nFIX: 说人话'), { auditFile: audit })
   await h.stop()
   const row = lastAuditRow(audit)
-  check('非第 1 条失分按比例折算（83 分）', row.score === 83, `score=${row.score}`)
-  check('非第 1 条失分不再直接打回', row.decision === 'pass', JSON.stringify(row))
-  check('失分的条目仍写进 worst 备查', String(row.worst ?? '').includes('第 2 条'), String(row.worst))
-  check('够分就不回炉', h.steered.length === 0, `steered=${h.steered.length}`)
+  check('非第 1 条低于 6 分也按 59 折算（49 分）', row.score === 49, `score=${row.score}`)
+  check('非第 1 条低于 6 分也直接打回', row.decision === 'fail', JSON.stringify(row))
+  check('失分的条目写进 worst', String(row.worst ?? '').includes('第 2 条'), String(row.worst))
+  check('低分就要真回炉', h.steered.length === 1, `steered=${h.steered.length}`)
+  h.cleanup()
+  fs.unlinkSync(audit)
+}
+
+// 35b. 只有「低于 6」才触发一票否决：6 分及以上仍按总分说话
+//      `1:10 2:6 3:10` → sum=26 → round(26/30*100)=87 分 pass（6 分是「做到一半」，不是不合格）
+{
+  const audit = tmpFile('audit-sc-six')
+  const h = checklistHarness(fakeLlm('1:10 2:6 3:10'), { auditFile: audit })
+  await h.stop()
+  const row = lastAuditRow(audit)
+  check('6 分不触发否决（87 分）', row.score === 87, `score=${row.score}`)
+  check('6 分不触发否决 → pass', row.decision === 'pass', JSON.stringify(row))
   h.cleanup()
   fs.unlinkSync(audit)
 }
@@ -1281,17 +1294,17 @@ const checklistHarness = (llm, config = {}) => {
 // 先加过第三态 na，但用户否了（「用户随时会去调整质检词，你不知道哪几条要打分」），
 // 于是改成**每条都给一个 0-10 的分**，「客观加不了」写进提示词算 10 分。
 
-// 65. 一条扣分但总体够分 → pass（yes/no 时代这里会被判 fail）
+// 65. 一条 4 分其余满分 → 一票否决（v1.5.0 起；v1.4.0 时这里是 80 分 pass）
 {
   const audit = tmpFile('audit-sc-partial-pass')
   const h = checklistHarness(fakeLlm('1:10 2:10 3:4\nFIX: 别旁生枝节'), { auditFile: audit })
   await h.stop()
   const row = lastAuditRow(audit)
-  check('一条 4 分其余满分 → 80 分', row.score === 80, `score=${row.score}`)
-  check('80 分判 pass（不再「任一条扣分即 fail」）', row.decision === 'pass', JSON.stringify(row))
+  check('一条 4 分其余满分 → 按 59 折算（47 分）', row.score === 47, `score=${row.score}`)
+  check('一条 4 分 → 直接打回（任一条可一票否决）', row.decision === 'fail', JSON.stringify(row))
   check('失分条目写进 worst', String(row.worst ?? '').includes('第 3 条'), String(row.worst))
   check('worst 带上实际得分', String(row.worst ?? '').includes('4/10'), String(row.worst))
-  check('不回炉', h.steered.length === 0, `steered=${h.steered.length}`)
+  check('低分要回炉', h.steered.length === 1, `steered=${h.steered.length}`)
   h.cleanup()
   fs.unlinkSync(audit)
 }

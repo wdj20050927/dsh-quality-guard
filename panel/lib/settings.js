@@ -65,7 +65,8 @@ export function defaults() {
     version: 1,
     enabled: true,
     dryRun: true,
-    triggers: { minReplyChars: 0, maxReworks: 3, scoreThreshold: 70 },
+    // v1.5.0：及格线 70 → 80（任一条 <6 分另外直接打回，但总分也要 80 才放行）。
+    triggers: { minReplyChars: 0, maxReworks: 3, scoreThreshold: 80 },
     // v1.4.0：超时不再由插件自己截（引擎里那段 setTimeout 已删），这个键只为兼容老 patch 保留。
     judge: { timeoutMs: 60000, maxTokens: null, model: null },
     // 判官两次都拿不到裁定时的出口（v5 三值逻辑的 unknown）：
@@ -91,7 +92,7 @@ export const FIELD_HELP = {
   dryRun: '演习模式。开＝只判断、只记日志、不打回；关＝判不过就真的打回重写。',
   minReplyChars: '回复短于这个字数就跳过检查。0＝每条都查（连「好的」也查）。',
   maxReworks: '同一条回复最多被打回几次，防死循环。0＝永不回炉。',
-  scoreThreshold: '判官打分的及格线（0-100）。低于它就算不过。',
+  scoreThreshold: '判官打分的及格线（0-100）。低于它就算不过。另外任一条判据低于 6 分，不管总分多少都直接打回（v1.5.0 起）。',
   onUnknown: '判官两次都拿不到裁定（断流、空输出、上游 502）时怎么办。放行＝旧行为，风险是漏判；打回＝宁严不宽，会多花一轮。v1.3.0 起默认打回。',
   reasoningEffort: '留「跟随模型默认」＝一个字节都不发，由这家 API 自己决定用多深的思考。只有你想强行压低思考成本时才挑一个具体档位。',
   timeoutMs: '已停用：v1.4.0 起判官不再自己设截止，等上游回话为止。',
