@@ -312,15 +312,33 @@ function judgePrompt(question, reply, criteria = CRITERIA) {
  * 可能带括号解释，让模型复述名字容易走样，**编号不会**。
  * 少于 2 条就当没有清单（单条判据折算分数没意义，退回老的 SCORE 问法）。
  */
-function checklistItems(criteria) {
+function checklistItems(criteria, labels = []) {
   const text = String(criteria ?? '')
   const items = []
   const pattern = /^[ \t]*(\d{1,2})[.、)][ \t]*(\S.*)$/gm
   let match
   while ((match = pattern.exec(text)) !== null) {
-    items.push({ id: Number(match[1]), text: match[2].trim() })
+    /**
+     * 中文名（`先说核心结论`）从面板的 `criteria[].label` 来，按「已启用判据的顺序」对齐。
+     * 没有就留空串，`labelOf` 会退回判据正文。
+     */
+    const label = typeof labels[items.length] === 'string' ? labels[items.length].trim() : ''
+    items.push({ id: Number(match[1]), text: match[2].trim(), label })
   }
   return items.length >= 2 ? items : []
+}
+
+/**
+ * 一条判据在面板/回炉文案里怎么称呼：有中文名用中文名，没有就退回判据正文。
+ *
+ * 为什么不写「第 N 条」：N 只是「已启用判据的顺序号」，用户一改启用集合或顺序就全错位，
+ * 历史行再也对不上；「先说核心结论」「人设」这类中文名是稳定的，正文也比编号好认。
+ */
+function labelOf(item) {
+  const label = typeof item.label === 'string' ? item.label.trim() : ''
+  if (label !== '') return label
+  const text = typeof item.text === 'string' ? item.text.trim() : ''
+  return text.length <= 40 ? text : `${text.slice(0, 40)}……`
 }
 
 /**
@@ -483,19 +501,28 @@ function scoreVerdict(text, items, threshold = 70) {
      * 一条「第 3 条 2/10」的回复就能被放行——那不是用户要的「每条都能踢一脚」。
      */
     verdict: result.score < threshold || low.length > 0 ? 'fail' : 'pass',
+    /**
+     * v1.5.1：worst 从「第 N 条只拿到 X/10：判据正文」改成「判据中文名（X/10）」。
+     * 用户原话：「最严重的一条的内容就是 没有遵循好的质检词（得分/满分）」——
+     * 他要的是**哪把尺子没达标 + 差多少**，不是让他在面板上自己数第几条。
+     * 中文名（label）来自面板判据的 `label` 字段；没有就退回判据正文（见 `labelOf`）。
+     */
     worst:
       low.length === 0
         ? ''
-        : `第 ${low.map((entry) => entry.item.id).join('、')} 条只拿到 ${low
-            .map((entry) => `${entry.score}/10`)
-            .join('、')}：${low.map((entry) => entry.item.text).join('；')}`,
+        : `没做到：${low.map((entry) => `${labelOf(entry.item)}（${entry.score}/10）`).join('、')}`,
     fix: result.fix,
     scoreSource: 'scores',
     /**
      * v1.4.0：`checks` 从 `ok:true/false` 改成 `score:0-10`（没答出来的是 undefined）。
      * 不改这里，事后就查不出「这条为什么扣分」「哪条判官一直给满/一直扣」。
+     * v1.5.1：顺手把中文名一起落进审计，历史行不用再去猜「第 3 条」对应哪条判据。
      */
-    checks: result.hits.map((hit, index) => ({ id: items[index].id, score: hit })),
+    checks: result.hits.map((hit, index) => ({
+      id: items[index].id,
+      label: labelOf(items[index]),
+      score: hit,
+    })),
     incomplete: result.complete ? undefined : result.missing,
   }
 }
@@ -1000,9 +1027,14 @@ export function apply(ctx, config) {
   /**
    * 把面板里那份「判据 + 例外」拼成给判官看的正文。
    * 全都没勾/全空 → 退回内置 CRITERIA（宁可判得严格，也不要静悄悄变成不查）。
+   *
+   * v1.5.1：顺带把**已启用判据的中文名**按同样的顺序吐出来（`labels`），
+   * 因为正文里只有编号和正文、没有中文名，而回炉文案和审计要的是中文名
+   * （用户原话：「最严重的一条的内容就是 没有遵循好的质检词（得分/满分）」）。
    */
   const composeLiveCriteria = (list, exceptions) => {
     const lines = ['判据（任一条不满足即不合格）：']
+    const labels = []
     let index = 0
     for (const item of list) {
       if (!item || item.enabled === false) continue
@@ -1010,8 +1042,9 @@ export function apply(ctx, config) {
       if (text === '') continue
       index += 1
       lines.push(`${index}. ${text}`)
+      labels.push(typeof item.label === 'string' ? item.label.trim() : '')
     }
-    if (index === 0) return CRITERIA
+    if (index === 0) return { text: CRITERIA, labels: [] }
     const extras = typeof exceptions === 'string' ? exceptions.trim() : ''
     if (extras !== '') {
       lines.push('')
@@ -1020,7 +1053,7 @@ export function apply(ctx, config) {
         if (line.trim() !== '') lines.push(`- ${line.trim()}`)
       }
     }
-    return lines.join('\n')
+    return { text: lines.join('\n'), labels }
   }
 
   const pickInt = (value, fallback, min, max) => {
@@ -1096,9 +1129,11 @@ export function apply(ctx, config) {
         })(),
         model: model ?? settings.model,
         auditFile: typeof parsed.auditFile === 'string' ? parsed.auditFile : settings.auditFile,
-        criteria: Array.isArray(parsed.criteria)
-          ? composeLiveCriteria(parsed.criteria, parsed.exceptions)
-          : criteriaText(),
+        ...(() => {
+          if (!Array.isArray(parsed.criteria)) return { criteria: criteriaText(), criteriaLabels: [] }
+          const composed = composeLiveCriteria(parsed.criteria, parsed.exceptions)
+          return { criteria: composed.text, criteriaLabels: composed.labels }
+        })(),
       }
       liveCache = { key, value }
       return value
@@ -1112,7 +1147,7 @@ export function apply(ctx, config) {
   const liveNow = () => {
     const fromFile = readLive()
     if (fromFile !== null) return fromFile
-    return { ...settings, criteria: criteriaText() }
+    return { ...settings, criteria: criteriaText(), criteriaLabels: [] }
   }
 
   // ── v1.3.1：跨轮记住「这个路由不认档位」，别再每轮白撞一次 ──────────────
@@ -1181,7 +1216,7 @@ export function apply(ctx, config) {
        * 生产数据说升档那一半从来没救回过东西（`attempts=2` 7 行、成功 0 行，全是被 provider 拒绝的 medium）。
        * 用户拍板：「这样换挡，重想通通没有」。plan 里现在只有预算一项，两槽完全一样。
        */
-      const items = checklistItems(live.criteria)
+      const items = checklistItems(live.criteria, live.criteriaLabels)
       const effortState = effortStateFor(route)
       const plan = { effort: effortToSend(live), ...slotBudget(live) }
       /**

@@ -14,15 +14,19 @@ import {
   copyFileSync,
   existsSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   renameSync,
   statSync,
   writeFileSync,
 } from 'node:fs'
+import { join } from 'node:path'
+import { zstdDecompressSync } from 'node:zlib'
 import {
   AUDIT_FILE,
   BACKUP_FILE,
   GUARD_DIR,
+  HOME_DIR,
   PROFILE_PATCH,
   SETTINGS_FILE,
   defaults,
@@ -67,17 +71,257 @@ function readAudit(limit) {
     if (!existsSync(AUDIT_FILE)) return []
     const raw = readFileSync(AUDIT_FILE, 'utf8')
     const lines = raw.split('\n').filter((line) => line.trim() !== '')
-    const tail = lines.slice(-limit)
-    return tail.map((line) => {
+    const parsed = lines.map((line) => {
       try {
         return JSON.parse(line)
       } catch {
         return { error: '无法解析的一行', raw: line.slice(0, 400) }
       }
     })
+    /**
+     * `judgeNth` = **这一轮对话里判官第几次出现**——就是 1、2、3 这种小数字，
+     * 对应「原文被判一次 → 打回重写再判 → 再打回再判」（`rework` 0 → 1 → 2）。
+     *
+     * 两个坑：
+     *   1. 不能拿整个会话累计 —— 那会数到几十，读的人根本对不上是哪一次打回。
+     *      所以按 `session + turn` 分组，每组内部重新从 1 数。
+     *   2. 不能拿 `turn` 顶替同一个意思 —— `turn` 是对话走到第几轮，和判官在这一轮
+     *      出场几次是两件事：同一 turn 有几行，每行代表这一轮里的一次判断。
+     * 计数必须基于**整份日志**（不能只数最后 N 行），否则分组会从中间截断、序号错位。
+     */
+    const ordinal = new Map()
+    for (const row of parsed) {
+      const id = normalizeSessionKey(row?.session)
+      const turn = row?.turn === undefined || row?.turn === null ? '' : String(row.turn)
+      const key = `${id}#${turn}`
+      const nth = (ordinal.get(key) ?? 0) + 1
+      ordinal.set(key, nth)
+      row.judgeNth = nth
+    }
+    return parsed.slice(-limit)
   } catch {
     return []
   }
+}
+
+/**
+ * 会话标题：审计行里只有 `session-<uuid>`，面板上光看一串 uuid 认不出是哪个对话。
+ *
+ * 两条路，先官方后自己解：
+ *   1. 宿主有官方服务 `sessionQuery.readTitleSnapshots(ids)`，它折的是日志里**最后一条**
+ *      `session/title` 事件（fork / 重命名都会再写一条），活跃会话还带缓存 —— 最快。
+ *   2. 但那个服务只认**它还留着索引**的会话，老会话一律
+ *      `SESSION_QUERY_SESSION_NOT_FOUND`（实测 22 个里只有 5 个能拿到）。这时退回自己
+ *      切帧解日志（见下面 `SESSIONS_DIR` 那段），覆盖到 22/22，17 个会话约 250 ms。
+ */
+const TITLE_TTL = 5 * 60 * 1000
+const TITLE_TIMEOUT = 8000
+const titleCache = new Map()
+let missingLogged = false
+
+function normalizeSessionKey(value) {
+  if (typeof value !== 'string') return ''
+  const trimmed = value.trim()
+  if (trimmed === '' || trimmed === 'undefined' || trimmed === 'null') return ''
+  return trimmed.startsWith('session-') ? trimmed.slice('session-'.length) : trimmed
+}
+
+/**
+ * 退路：`sessionQuery.readTitleSnapshots` 只认**它还留着索引**的会话，老会话一律
+ * `SESSION_QUERY_SESSION_NOT_FOUND`（实测 22 个里只有 5 个能拿到标题）。而日志本身
+ * 都还在 `<HOME>/.dsh/sessions/<workspace>/session-<uuid>/session.v4.jsonl.zstd` 里，
+ * 直接切帧解 zstd 抠最后一条 `session/title` 就能补上。
+ *
+ * 为什么自己切帧：`zstdDecompressSync` 只解出第一帧，单文件是几百帧拼起来的。
+ */
+const SESSIONS_DIR = join(HOME_DIR, 'sessions')
+const ZSTD_MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd])
+const SESSION_INDEX_TTL = 10 * 60 * 1000
+let sessionIndex = null
+let sessionIndexAt = 0
+
+/** `<uuid>` → 会话目录的扁平索引（10 分钟重建一次；504 个目录扫一遍约 10 ms）。 */
+function buildSessionIndex() {
+  const index = new Map()
+  let workspaces = []
+  try {
+    workspaces = readdirSync(SESSIONS_DIR, { withFileTypes: true }).filter((entry) => entry.isDirectory())
+  } catch {
+    return index
+  }
+  for (const workspace of workspaces) {
+    let children = []
+    try {
+      children = readdirSync(join(SESSIONS_DIR, workspace.name), { withFileTypes: true })
+    } catch {
+      continue
+    }
+    for (const child of children) {
+      if (!child.isDirectory()) continue
+      const bare = normalizeSessionKey(child.name)
+      if (bare === '' || index.has(bare)) continue
+      index.set(bare, join(SESSIONS_DIR, workspace.name, child.name))
+    }
+  }
+  return index
+}
+
+function findSessionDir(id) {
+  const now = Date.now()
+  if (sessionIndex === null || now - sessionIndexAt > SESSION_INDEX_TTL) {
+    sessionIndex = buildSessionIndex()
+    sessionIndexAt = now
+  }
+  return sessionIndex.get(id)
+}
+
+/** 多帧 zstd → 事件数组；坏行、坏帧都跳过，绝不抛。 */
+function readSessionEvents(file) {
+  let buf = null
+  try {
+    buf = readFileSync(file)
+  } catch {
+    return []
+  }
+  const parts = []
+  let offset = 0
+  while (offset < buf.length) {
+    const start = buf.indexOf(ZSTD_MAGIC, offset)
+    if (start === -1) break
+    let next = buf.indexOf(ZSTD_MAGIC, start + 4)
+    let done = false
+    while (true) {
+      const end = next === -1 ? buf.length : next
+      try {
+        parts.push(zstdDecompressSync(buf.subarray(start, end)))
+        offset = end
+        done = true
+        break
+      } catch {
+        if (next === -1) break
+        next = buf.indexOf(ZSTD_MAGIC, next + 4)
+      }
+    }
+    if (!done) {
+      if (next === -1) break
+      offset = next
+    }
+  }
+  const events = []
+  for (const line of Buffer.concat(parts).toString('utf8').split('\n')) {
+    if (line.trim() === '') continue
+    try {
+      events.push(JSON.parse(line))
+    } catch {
+      // 半行/坏行跳过
+    }
+  }
+  return events
+}
+
+/** 读一个会话日志的最后一条 `session/title`；没有就是空串。 */
+function readTitleFromDisk(id) {
+  const dir = findSessionDir(id)
+  if (dir === undefined) return ''
+  const events = readSessionEvents(join(dir, 'session.v4.jsonl.zstd'))
+  // 取最后一条：fork / 重命名都会再写一条，早的那条是 seed 时复制过来的旧标题。
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const event = events[i]
+    if (event?.type === 'session/title' && typeof event?.data?.title === 'string' && event.data.title !== '') {
+      return event.data.title
+    }
+  }
+  return ''
+}
+
+/**
+ * 可选服务，只能 `ctx.get(...)` 现取：
+ * 把 `sessionQuery` 写进 `ctx.inject([...])` 会变成硬依赖——老版本宿主没有这个服务时，
+ * 整块回调不跑，`webServer` 也跟着死，面板直接 404（本文件顶部那条注释记的就是这个坑）。
+ */
+function resolveSessionQuery() {
+  for (const scope of [serviceScope, rootScope]) {
+    if (scope === null || scope === undefined) continue
+    try {
+      const service = scope.get?.('sessionQuery') ?? scope.sessionQuery
+      if (typeof service?.readTitleSnapshots === 'function') return service
+    } catch (error) {
+      logHost(`取 sessionQuery 抛错：${String((error && error.message) || error)}`)
+    }
+  }
+  // 只抱怨一次：面板每 5 分钟会重试一轮，每次都写会让日志淹掉别的诊断。
+  if (!missingLogged) {
+    missingLogged = true
+    logHost('sessionQuery 不可用（面板只显示会话短号）')
+  }
+  return null
+}
+
+async function warmTitles(ids) {
+  const stale = ids.filter((id) => {
+    const hit = titleCache.get(id)
+    return hit === undefined || Date.now() - hit.at > TITLE_TTL
+  })
+  if (stale.length === 0) return
+  const service = resolveSessionQuery()
+  /**
+   * 超时护栏：这一路是「读日志折标题」，冷会话多了会慢。面板 15 s 会超时，
+   * 但**没有标题也不能让整张表出不来**——超时就直接按「没有标题」渲染。
+   */
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), TITLE_TIMEOUT)
+  try {
+    if (service !== null) {
+      /**
+       * 传**归一后**的 id（去掉 `session-` 前缀）：日志里的 `SessionHeader.id` 就是这个形态，
+       * 而审计行有的带前缀有的是裸 uuid（历史原因，30 条裸的），统一成裸的才都对得上。
+       */
+      const results = await service.readTitleSnapshots(stale, controller.signal)
+      const now = Date.now()
+      for (const item of Array.isArray(results) ? results : []) {
+        const id = normalizeSessionKey(item?.sessionId)
+        if (id === '') continue
+        const title = item?.status === 'fulfilled' ? item?.value?.title?.title : ''
+        if (typeof title === 'string' && title !== '') titleCache.set(id, { title, at: now })
+      }
+    }
+    /** 服务查不到的（老会话大多 `SESSION_QUERY_SESSION_NOT_FOUND`）退回自己解日志。 */
+    const missing = stale.filter((id) => !titleCache.has(id))
+    if (missing.length > 0) {
+      const started = Date.now()
+      const now = Date.now()
+      let hit = 0
+      for (const id of missing) {
+        if (controller.signal.aborted) break
+        const title = readTitleFromDisk(id)
+        if (title !== '') hit += 1
+        // 查不到也写空串：否则每刷新一次都要把这批几百 MB 的日志再解一遍。
+        titleCache.set(id, { title, at: now })
+      }
+      logHost(`磁盘退路：${missing.length} 个会话 → 命中 ${hit}，耗时 ${Date.now() - started}ms`)
+    }
+  } catch (error) {
+    logHost(`取标题失败：${String((error && error.message) || error)}`)
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/** 给审计行补上 `sessionId`（短号）与 `sessionTitle`（拿不到就是空串）。 */
+async function withTitles(rows) {
+  const ids = []
+  for (const row of rows) {
+    const id = normalizeSessionKey(row?.session)
+    if (id !== '' && !ids.includes(id)) ids.push(id)
+  }
+  if (ids.length > 0) await warmTitles(ids)
+  return rows.map((row) => {
+    if (row === null || typeof row !== 'object') return row
+    // 出错行（判官超时之类）也照样标上对话：它同样属于某个会话，读者更该知道是哪个。
+    const id = normalizeSessionKey(row.session)
+    const title = titleCache.get(id)?.title ?? ''
+    return { ...row, sessionId: id, sessionTitle: title }
+  })
 }
 
 /**
@@ -176,6 +420,8 @@ function sendJson(res, status, payload) {
  *   llm 每次请求时 try 一次，拿不到就老实回 available:false，面板退回手填。
  */
 let serviceScope = null
+/** apply 拿到的根 ctx。scoped fiber 是 webServer 那一层，`sessionQuery` 在根上也可能可取。 */
+let rootScope = null
 
 function resolveLlm() {
   try {
@@ -261,7 +507,7 @@ function readBody(req) {
   })
 }
 
-function statePayload(limit = 20) {
+async function statePayload(limit = 20) {
   let current = readSettingsFile()
   let degraded = false
   try {
@@ -281,7 +527,7 @@ function statePayload(limit = 20) {
       audit: fileInfo(AUDIT_FILE),
       backup: fileInfo(BACKUP_FILE),
     },
-    audit: readAudit(limit),
+    audit: await withTitles(readAudit(limit)),
     now: new Date().toISOString(),
   }
 }
@@ -295,12 +541,12 @@ async function handle(req, res) {
   try {
     if (req.method === 'GET' && (route === '/state' || route === '/')) {
       const limit = Math.min(Math.max(Number(url.searchParams.get('limit') ?? 20) || 20, 1), 200)
-      sendJson(res, 200, statePayload(limit))
+      sendJson(res, 200, await statePayload(limit))
       return
     }
     if (req.method === 'GET' && route === '/audit') {
       const limit = Math.min(Math.max(Number(url.searchParams.get('limit') ?? 30) || 30, 1), 200)
-      sendJson(res, 200, { ok: true, audit: readAudit(limit) })
+      sendJson(res, 200, { ok: true, audit: await withTitles(readAudit(limit)) })
       return
     }
     if (req.method === 'GET' && route === '/models') {
@@ -345,6 +591,7 @@ async function handle(req, res) {
 /** 第一次加载就把默认设置落盘，省得引擎和面板各猜一套默认值。 */
 export function apply(ctx) {
   logHost(`apply start pid=${process.pid}`)
+  rootScope = ctx
   try {
     mkdirSync(GUARD_DIR, { recursive: true })
   } catch {

@@ -186,6 +186,17 @@ window.__ModuleLoader__.load({
 }
 .qg-audit th { color: var(--dsw-alias-label-tertiary); font-weight: 500; }
 .qg-audit td.num { font-variant-numeric: tabular-nums; font-family: var(--ds-font-family-code, ui-monospace, monospace); }
+.qg-audit td:last-child { min-width: 220px; }
+.qg-session { display: flex; flex-direction: column; gap: 1px; max-width: 220px; }
+.qg-session-title {
+  color: var(--dsw-alias-label-primary);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.qg-session-id {
+  color: var(--dsw-alias-label-tertiary); font-size: 11px;
+  font-family: var(--ds-font-family-code, ui-monospace, monospace);
+}
+.qg-muted { color: var(--dsw-alias-label-tertiary); }
 .qg-tag {
   display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11.5px;
   border: 1px solid var(--dsw-alias-border-l2);
@@ -465,6 +476,24 @@ window.__ModuleLoader__.load({
       return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
     }
 
+    /**
+     * 这一条判的是「哪个对话」。宿主侧已经把 `sessionTitle` / `sessionId` 补在每一行上了
+     * （`lib/index.js` 的 `withTitles`），拿不到标题就退回短号——
+     * 光给一串 `session-xxxxxxxx-…` 认不出是哪个对话，光给标题又不好对照日志。
+     */
+    function sessionCell(entry) {
+      const id = typeof entry.sessionId === 'string' && entry.sessionId !== '' ? entry.sessionId : ''
+      const title = typeof entry.sessionTitle === 'string' ? entry.sessionTitle.trim() : ''
+      if (id === '' && title === '') return h('span', { className: 'qg-muted' }, '-')
+      const label = title !== '' ? title : id.slice(0, 8)
+      return h(
+        'div',
+        { className: 'qg-session', title: id === '' ? title : `session-${id}` },
+        h('span', { className: 'qg-session-title' }, label),
+        id !== '' && title !== '' ? h('span', { className: 'qg-session-id' }, id.slice(0, 8)) : null,
+      )
+    }
+
     function auditRow(entry, index) {
       let tag = ['idle', '没判']
       if (entry.error !== undefined) tag = ['fail', '出错放行']
@@ -474,6 +503,15 @@ window.__ModuleLoader__.load({
         'tr',
         { key: `${entry.at ?? index}-${index}` },
         h('td', { className: 'num' }, formatTime(entry.at)),
+        h('td', null, sessionCell(entry)),
+        /** 这一列是「**这一轮对话里判官第几次出现**」（1、2、3 这种小数字，对应被打回几次）。 */
+        h(
+          'td',
+          { className: 'num', title: entry.turn === undefined ? undefined : `对话第 ${entry.turn} 轮` },
+          entry.judgeNth === undefined || entry.judgeNth === null
+            ? entry.turn === undefined || entry.turn === null ? '-' : String(entry.turn)
+            : String(entry.judgeNth),
+        ),
         h('td', { className: 'num' }, entry.score === undefined ? '-' : String(entry.score)),
         h('td', null, h('span', { className: `qg-tag ${tag[0]}` }, tag[1])),
         h('td', null, entry.error !== undefined ? String(entry.error) : entry.worst || '-'),
@@ -996,6 +1034,8 @@ window.__ModuleLoader__.load({
                       'tr',
                       null,
                       h('th', null, '时间'),
+                      h('th', null, '对话'),
+                      h('th', null, '判官第几次'),
                       h('th', null, '分'),
                       h('th', null, '结果'),
                       h('th', null, '最严重的那条'),
