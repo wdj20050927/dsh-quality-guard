@@ -60,6 +60,26 @@ v1.4.0 起判官走**逐条 0-10 打分**：判据里只要有 ≥2 条编号条
 
 ## 安装
 
+### 0. 面板一条命令装（可选，先装这个也行）
+
+```bash
+dsh plugin --profile web add github:wdj20050927/dsh-quality-guard
+```
+
+仓库根的 `package.json` 声明了 `dsh.bundle.patch: ./panel/cordis.patch.yml`，装完 dsh 会自动把 `quality-guard` 这一行插进你的 profile 层（`dsh --profile web --dump-config` 能看见 `- id: quality-guard`）。重启后侧边栏出现「质检」。
+
+想先确认真的插进去了，装完跑 `dsh --profile web --dump-config`，输出里应当出现这两行：
+
+```
+# == dsh-quality-guard
+- id: quality-guard
+  name: dsh-quality-guard
+```
+
+（只装了面板没装引擎也能跑，只是没有东西去读它写的设置。）
+
+引擎**不能**这样装——它要按绝对路径挂、要指你自己的配置路径，按下面第 1 节走。
+
 ### 1. 引擎（必须）
 
 ```bash
@@ -88,6 +108,10 @@ v1.4.0 起判官走**逐条 0-10 打分**：判据里只要有 ≥2 条编号条
 `settings.json` 不存在也没关系：引擎会用 patch 里的静态配置 + `criteriaFile` 开跑。
 
 ### 2. 面板（可选）
+
+**推荐**：见上面第 0 节，一条 `dsh plugin` 命令搞定。
+
+手动装（本机开发时调试实体文件用，或者你的 dsh 版本不支持 `dsh.bundle`）：
 
 ```bash
 # 拷到插件目录

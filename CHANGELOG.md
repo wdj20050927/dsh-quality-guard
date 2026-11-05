@@ -1,5 +1,32 @@
 # 更新日志
 
+## v1.6.1 — 2026-11-05
+
+**装了没人知道 = 没写。** 起因是查自己仓库的数据：1 个 star（本人点的）、外部 referrer 为 0、clone 全是自己的开发循环。功能没问题，问题是它进不了任何市场——三个 dsh 市场（dsh-market / dshget.com / plugin.dshx.dev）都从 `awesome-dsh-plugin/awesome-dsh-plugin` 同步，而那条收录流水线在 CI 里卡一条硬门槛：**`package.json` 必须在仓库根，或在 `packages/ packages/ plugins/ apps/` 子包里声明 `dsh.bundle`**。本仓库此前只有 `panel/package.json`，根上没有，等于永远进不去。
+
+### 仓库根新增 `package.json`
+
+- 把 `panel/package.json` 里的 manifest 提到根：`name: dsh-quality-guard`、`version: 1.6.1`、`type: module`、`exports`（`.` → `./panel/lib/index.js`、`./client`、`./engine`、`./cordis.patch.yml`）、`dsh.bundle.patch: ./panel/cordis.patch.yml`、`dsh.client`、`peerDependencies.react`。
+- 补 `repository` / `homepage` / `bugs` / `keywords` / `files`——市场卡片和 npm 页面读这几个字段。
+- **实测过**：`dsh plugin --profile web add <本地路径>` 之后 `dsh --profile web --dump-config` 输出里出现 `# == dsh-quality-guard` 与 `- id: quality-guard`，不再是「declares no dsh.bundle」的警告。
+- 试完已把测试 profile 还原（`web` 的 `package.json` 回到无 dependencies 状态，node_modules 里的目录联接删掉）。
+
+### README 新增「0. 面板一条命令装」
+
+原先只有「拷目录 + 手改 patch + `mklink /J`」三步，对外人来说全是劝退点。现在第一节就是：
+
+```bash
+dsh plugin --profile web add github:wdj20050927/dsh-quality-guard
+```
+
+并写明验证方式（`--dump-config` 里找 `- id: quality-guard`）与「引擎不能这样装」的原因（引擎要按绝对路径挂、要指自己的 `settingsFile`）。
+
+### 已知坑（写进 README 时踩到的）
+
+- **git-hosted 装法会报 `ERR_PNPM_EPERM`**：`E… rename 'node_modules\dsh-quality-guard_tmp_23312_1' -> 'node_modules\dsh-quality-guard'`。原因是上一次失败留下了目录联接。删掉那个联接重跑就过了。
+- **git-hosted 装出来 version 是 `0.0.0`**：pnpm 从 git 装不跑 `prepack`，读不到根 manifest 的 version。不影响功能，但 `package.json` 的 `version` 字段在 git 装法下不可信。
+- 先装面板再装引擎是可以的：面板只写 `settings.json`，引擎每轮现读；没引擎时面板就是个空转的编辑器。
+
 ## v1.6.0 — 2026-11-05
 
 用户原话：「关于质检这个，我希望要给出是哪个对话的第几轮 / 然后最严重的一条的内容就是 没有遵循好的质检词（得分/满分）」。两句各对应一处：面板认不出是哪场对话，他也说不出「哪把尺子没达标、差多少」。

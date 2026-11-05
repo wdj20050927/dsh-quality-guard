@@ -1,0 +1,57 @@
+{
+  "name": "dsh-quality-guard",
+  "version": "1.6.1",
+  "private": true,
+  "description": "发消息之前，先让另一个模型读一遍：dsh 插件组合（引擎 hooks + 可视化质检面板）。",
+  "type": "module",
+  "main": "./panel/lib/index.js",
+  "exports": {
+    ".": "./panel/lib/index.js",
+    "./client": "./panel/lib/client.js",
+    "./engine": "./engine/index.mjs",
+    "./cordis.patch.yml": "./panel/cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "engine/",
+    "panel/",
+    "examples/",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "deepseek",
+    "harness",
+    "dsh",
+    "dsh-plugin",
+    "quality",
+    "review",
+    "guard",
+    "self-check"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wdj20050927/dsh-quality-guard.git"
+  },
+  "homepage": "https://github.com/wdj20050927/dsh-quality-guard#readme",
+  "bugs": {
+    "url": "https://github.com/wdj20050927/dsh-quality-guard/issues"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./panel/cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-layout"
+      ],
+      "platform": "web"
+    }
+  },
+  "peerDependencies": {
+    "react": "^18.2.0"
+  },
+  "license": "MIT"
+}
