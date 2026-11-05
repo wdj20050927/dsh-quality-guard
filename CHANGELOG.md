@@ -1,5 +1,41 @@
 # 更新日志
 
+## v1.6.0 — 2026-11-05
+
+用户原话：「关于质检这个，我希望要给出是哪个对话的第几轮 / 然后最严重的一条的内容就是 没有遵循好的质检词（得分/满分）」。两句各对应一处：面板认不出是哪场对话，他也说不出「哪把尺子没达标、差多少」。
+
+### 引擎 `engine/index.mjs`
+
+- **`worst` 从「第 N 条只拿到 X/10：判据正文」改成「没做到：判据中文名（X/10）」**。原来的 `第 N 条` 是 `checklistItems` 从 `composeLiveCriteria` 生成的 `1. text` 行里抠出来的**顺序号**——用户一动启用集合或顺序，历史行全部错位。改成取面板 `criteria[].label`（`先说核心结论`／`人设` 这种稳定中文名）。
+- `checklistItems(criteria, labels = [])` 多收一个 label 数组，按「已启用判据的顺序」对齐；新增 `labelOf(item)`，没有 label 退回判据正文（超 40 字截断）。
+- `readLive()` / `liveNow()` 一并返回 `criteriaLabels`，`composeLiveCriteria` 只写 `text` 不写 label 的老行为保持兼容。
+- `checks` 每条多带 `label`，面板与审计对得上同一把尺子。
+
+### 面板 `panel/lib/index.js`（宿主半侧）
+
+- **`readAudit` 补 `judgeNth`**：按 `session + turn` 分组，组内从 1 数（1、2、3 这种小数字，对应 `rework` 0→1→2）。不能拿 `turn` 顶替，也不能拿整个会话累计（会数到几十）。计数扫整份日志后再切尾巴，否则分组会从中间截断。
+- **`withTitles` 补对话标题**：先走 `sessionQuery.readTitleSnapshots`；实测 audit 里 22 个会话只有 5 个能查到（其余 `SESSION_QUERY_SESSION_NOT_FOUND`），于是加**磁盘退路**——扫 `~/.dsh/sessions/<workspace>/session-<uuid>/session.v4.jsonl.zstd`，按 zstd magic `28 b5 2f fd` 切帧逐帧解，从事件里倒序取最后一条 `session/title` 的 `data.title`。实测 17 个会话 240 ms 全部命中，覆盖率 5/22 → 22/22。
+  - `zstdDecompressSync` 直接喂整文件只解出第一帧，必须自己切帧——这是退路存在的唯一理由。
+  - 会话索引缓存 10 分钟（`SESSION_INDEX_TTL`），标题缓存 5 分钟（`TITLE_TTL`），单次调用 8 s 超时。
+- **判官出错的行也补标题**：`withTitles` 的提前返回从 `row.error !== undefined` 改成只判 `row === null || typeof row !== 'object'`，此前 2 行「判官超时」没有会话名。
+
+### 面板 `panel/lib/client.js`
+
+- 表格 4 列 → **6 列**：`时间 / 对话 / 判官第几次 / 分 / 结果 / 最严重的那条`。
+- `sessionCell`：主行显示标题，次行显示 8 位短号（只有标题没有号时不显示次行），鼠标悬停给完整 `session-<uuid>`。
+- 「判官第几次」列渲染 `judgeNth`，悬停提示「对话第 N 轮」；老数据无 `judgeNth` 时退回 `turn`。
+
+### 测试
+
+- `engine/selftest.mjs` 三条断言同步：worst 里找中文名而不是「第 N 条」，新增「worst 是『判据名（得分/10）』格式」和「checks 也带上判据名」两条。**222 passed, 0 failed**。
+- 面板渲染冒烟 `render-panel.mjs`：表头 6 列渲出，样例行 `["11-05 12:56","博主跟买与模拟盘方案 34c44afa","7","41","不过·打回","没做到：不旁生枝节（4/10）、人设（2/10）"]`。
+
+### 升级注意
+
+- 改 `engine/index.mjs` 后**光 disable+enable 不生效**：HMR 按模块文件身份（inode/大小/mtime）判断，同路径原地改不会重新 import。要么重启 dsh，要么把文件另存为新名字（如 `index-151.mjs`）再改 `cordis.patch.yml` 的 `name` 指过去。
+- 改 `panel/lib/index.js` 后 `plugin_manager set_plugin`（`include:quality-guard`）关一次再开一次即可，不必重启；前端 `client.js` 需要刷新页面。
+- 历史审计行不回填：170 行旧格式 `第 N 条 只拿到 X/10：…` 保持原样，面板只显示最后 20 条，按当轮 settings 反推 label 在判据顺序变动后必然错。
+
 ## v1.5.0 — 2026-11-03
 
 用户原话：「改，必须改，你现在这个给分太宽泛了，谁都可以踢一脚，怎么行」。起因是他贴来一份堆了三张表、十几个小节的报告问「这是怎么通过的」——审计查出来 **84 分 pass**。
