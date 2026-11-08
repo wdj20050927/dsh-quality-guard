@@ -1,6 +1,6 @@
 {
   "name": "dsh-quality-guard-engine",
-  "version": "1.7.2",
+  "version": "1.7.3",
   "private": true,
   "type": "module",
   "description": "质检引擎（selfcheck-guard）—— 与面板同仓，单独成包名，避免与 panel 争同一个 dsh.client 来源。"

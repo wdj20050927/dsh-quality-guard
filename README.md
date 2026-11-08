@@ -80,8 +80,16 @@ v1.4.0 起判官走**逐条 0-10 打分**：判据里只要有 ≥2 条编号条
 **一条命令，面板和引擎一起装上：**
 
 ```bash
-dsh plugin --profile web add https://github.com/wdj20050927/dsh-quality-guard/releases/download/v1.7.2/dsh-quality-guard-1.7.2.tgz
+dsh plugin --profile web add dsh-quality-guard
 ```
+
+仓库也发到了 npm（`https://registry.npmjs.org/dsh-quality-guard` → 最新 `1.7.3`），所以直接给包名就行。不想走 npm 的话，同一个包也放在 GitHub Release 上：
+
+```bash
+dsh plugin --profile web add https://github.com/wdj20050927/dsh-quality-guard/releases/download/v1.7.3/dsh-quality-guard-1.7.3.tgz
+```
+
+两条装出来的是同一个东西（`dsh plugin add` 既认 npm 包名，也认 `.tgz` 直链——`@deepseek-ai/dsh-plugin-manager` 的 `PACKAGE_NAME` 与 `TARBALL_SPEC`）。
 
 把 `web` 换成你实际用的 profile 名（桌面版一般是 `desktop`）。装完重启 dsh，侧边栏出现「质检」，引擎也已经在跑——`package.json` 里的 `dsh.bundle.patch` 指向 `panel/cordis.patch.yml`，那个文件一次 `insert` 了两条：面板（`quality-guard`）和引擎（`selfcheck-guard`，`name: ../engine/index.mjs`，相对 patch 文件所在目录解析）。
 
@@ -103,9 +111,13 @@ dsh --profile web --dump-config
     file:///.../node_modules/dsh-quality-guard/engine/index.mjs
 ```
 
-### 为什么不用 npm 包名装
+### 为什么 npm 上有个 `0.0.0-stage`
 
-npm 上还没有这个包（`https://registry.npmjs.org/dsh-quality-guard` → 404）。上面那条是 GitHub Release 里预构建好的 tarball，`dsh plugin add` 认 `.tgz` 直链（`@deepseek-ai/dsh-plugin-manager` 的 `TARBALL_SPEC`），装出来的和 npm 包一模一样。
+npm 从 CLI 11.15.0 起上了[staged publishing](https://docs.npmjs.com/staged-publishing/)：首次发布一个**还不存在**的包名时，registry 先登记一个 `0.0.0-stage` 占位版本，官方原文「When you stage a package that does not yet exist, npm publishes a placeholder version of the package with the version `0.0.0-stage`. This placeholder version is publicly available」。`dist-tags.latest` 随后会指向真正批准过的版本（现在是 `1.7.3`），占位桩留在 `versions` 列表里不碍事。
+
+### 别再往 npm 发包时踩的两个坑
+
+`package.json` 里不能有 `"private": true`（npm 官方：「If you set `"private": true` in your package.json, then npm will refuse to publish it.」）；token 必须勾 **Bypass 2FA**，否则 `pnpm publish` 回 `[E403] … Two-factor authentication or granular access token with bypass 2fa enabled is required to publish packages.`。
 
 `github:wdj20050927/dsh-quality-guard` 这种 git 装法也能装出面板，但不推荐：pnpm 从 git 装不跑 `prepack`，版本号会读成 `0.0.0`，而且上一次失败留下的目录联接会让重跑报 `ERR_PNPM_EPERM`。
 

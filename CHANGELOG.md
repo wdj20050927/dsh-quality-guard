@@ -1,5 +1,22 @@
 # 更新日志
 
+## v1.7.3 — 2026-11-08
+
+**发上 npm 了。** 现在 `dsh plugin add dsh-quality-guard` 一条命令就能装，不用再贴 tarball 直链。
+
+### 包名进了 registry
+
+`pnpm publish --no-git-checks --access public` 之后 `https://registry.npmjs.org/dsh-quality-guard` → `latest=1.7.2`。第一次发新包名会先落一个 `0.0.0-stage` 占位桩（npm 的 staged publishing：`docs.npmjs.com/staged-publishing` 原文「When you stage a package that does not yet exist, npm publishes a placeholder version … `0.0.0-stage`」），随后的真版本覆盖 `dist-tags.latest`，占位桩留在 `versions` 里。
+
+### 为发 npm 做的前置改动
+
+- 根 `package.json` 去掉 `"private": true`（npm 官方：「If you set `"private": true` … npm will refuse to publish it.」）。
+- 发布 token 必须勾 **Bypass 2FA**，否则报 `[E403] … Two-factor authentication or granular access token with bypass 2fa enabled is required to publish packages.`
+
+### 安装节改口径
+
+README 的「安装」现在先给包名装法，tarball 直链退为备用；原先那节「为什么不用 npm 包名装」改成「为什么 npm 上有个 `0.0.0-stage`」。
+
 ## v1.7.2 — 2026-11-08
 
 修上一个版本自带的谎报：**刚装好的人会看到「没有引擎在跑」**。
