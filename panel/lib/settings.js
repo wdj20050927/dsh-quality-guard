@@ -17,8 +17,14 @@ export const SETTINGS_FILE = join(GUARD_DIR, 'settings.json')
 export const AUDIT_FILE = join(GUARD_DIR, 'audit.jsonl')
 export const BACKUP_FILE = join(GUARD_DIR, 'settings.json.bak')
 
-/** 面板里要显示的两个引擎条目的落点（只读探测其挂载状态）。 */
-export const PROFILE_PATCH = join(HOME_DIR, 'profiles', 'desktop', 'cordis.patch.yml')
+/**
+ * 面板里要显示的两个引擎条目的落点（只读探测其挂载状态）。
+ *
+ * v1.7.1：这里以前写死 `profiles/desktop/`。插件装到别的 profile（`web` / `tui` / 市场建的任意
+ * profile）时，面板读的是一个跟它无关的文件，于是横幅会谎报「没有任何质检引擎在跑」。
+ * 现在只给目录，由宿主半侧把所有 profile 都扫一遍（见 index.js 的 probeEngines）。
+ */
+export const PROFILES_DIR = join(HOME_DIR, 'profiles')
 
 /** 判据默认值：抄用户的原话，不加解释。 */
 export const DEFAULT_CRITERIA = [

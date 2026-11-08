@@ -1,6 +1,6 @@
 {
   "name": "dsh-quality-guard",
-  "version": "1.7.0",
+  "version": "1.7.1",
   "private": true,
   "description": "质检面板：把「发消息前质检」的触发条件与判据可视化，侧边栏一个入口，改完即时生效。引擎是同一仓库里的 engine/（selfcheck-guard）。",
   "type": "module",

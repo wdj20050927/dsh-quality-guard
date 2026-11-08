@@ -1,11 +1,23 @@
-# dsh-quality-guard —— 「发消息前质检」的可视化面板。
+# dsh-quality-guard —— 「发消息前质检」的可视化面板 + 引擎挂载。
 #
 # 两半：
 #   宿主半侧 lib/index.js  在同一个 web server 上开 /quality-guard/api（读写 settings.json）
-#   客户端半侧 lib/client.js 往侧边栏面板列表加一行「质检」，主栏加一页编辑器
+#   客户端半侧 lib/client.js 往侧边栏面板列表加一行「质检」，主栏加一项编辑器
 #
 # 真源是 ~/.dsh/quality-guard/settings.json：这一份 YAML 只负责把插件挂起来。
 # 引擎（selfcheck-guard）每轮现读 settings.json，所以页面改完下一轮就生效，不用重启。
 - insert:
     - id: quality-guard
       name: dsh-quality-guard
+
+# 引擎：按相对路径挂（相对本文件所在的 panel/ 目录），配置路径全部现场按 homedir 算，
+# 这样一条命令装完就两个半侧都在，不用再手改 cordis.patch.yml。
+- insert:
+    - id: selfcheck-guard
+      name: ../engine/index.mjs
+      config:
+        settingsFile: !!js "process.getBuiltinModule('node:os').homedir().replace(/\\\\/g, '/') + '/.dsh/quality-guard/settings.json'"
+        auditFile: !!js "process.getBuiltinModule('node:os').homedir().replace(/\\\\/g, '/') + '/.dsh/quality-guard/audit.jsonl'"
+        dryRun: true
+        maxReworks: 3
+        timeoutMs: 60000

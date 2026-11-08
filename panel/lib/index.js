@@ -27,7 +27,7 @@ import {
   BACKUP_FILE,
   GUARD_DIR,
   HOME_DIR,
-  PROFILE_PATCH,
+  PROFILES_DIR,
   SETTINGS_FILE,
   defaults,
   normalize,
@@ -327,26 +327,60 @@ async function withTitles(rows) {
 /**
  * 只读探测两套引擎在 profile patch 里的状态。
  * 只认「没被 # 注释掉的 - id: xxx」这一行，所以无需 YAML 解析。
+ *
+ * v1.7.1：扫 `~/.dsh/profiles/*` 下所有 profile，而不是写死 `desktop`。
+ * 引擎可能挂在任意一个 profile 里（插件自己装到 `web` 也会挂），只认一个目录会误报「没引擎在跑」。
+ * 返回 `patchFiles` 让页面能说清是在哪个文件里找到的。
  */
+function profilePatches() {
+  const found = []
+  let names = []
+  try {
+    names = readdirSync(PROFILES_DIR)
+  } catch {
+    return found
+  }
+  for (const profile of names.sort()) {
+    const file = join(PROFILES_DIR, profile, 'cordis.patch.yml')
+    try {
+      if (statSync(file).isFile()) found.push({ profile, file, text: readFileSync(file, 'utf8') })
+    } catch {
+      // 这个 profile 没有 patch 文件，跳过。
+    }
+  }
+  return found
+}
+
 function probeEngines() {
   const result = {
     selfcheck: { id: 'selfcheck-guard', mounted: false },
     fork: { id: 'quality-review', mounted: false, enabled: false, maxRounds: null },
     conflict: false,
+    patchFiles: [],
   }
-  let text = ''
-  try {
-    text = readFileSync(PROFILE_PATCH, 'utf8')
-  } catch {
-    return result
-  }
+  const patches = profilePatches()
+  result.patchFiles = patches.map((entry) => entry.file)
+  const where = { selfcheck: [], fork: [] }
+  for (const patch of patches) scanEngines(patch.text, result, where, patch.profile)
+  if (where.selfcheck.length > 0) result.selfcheck.profiles = where.selfcheck
+  if (where.fork.length > 0) result.fork.profiles = where.fork
+  result.conflict = result.selfcheck.mounted && result.fork.mounted && result.fork.enabled
+  return result
+}
+
+/** 扫一段 patch 文本，把命中写进 result，并把命中的 profile 名记到 where。 */
+function scanEngines(text, result, where, profile) {
   const lines = text.split('\n')
   for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i]
     if (/^\s*#/.test(line)) continue
-    if (/^\s*-\s*id:\s*selfcheck-guard\s*$/.test(line)) result.selfcheck.mounted = true
+    if (/^\s*-\s*id:\s*selfcheck-guard\s*$/.test(line)) {
+      result.selfcheck.mounted = true
+      if (!where.selfcheck.includes(profile)) where.selfcheck.push(profile)
+    }
     if (/^\s*-\s*id:\s*quality-review\s*$/.test(line)) {
       result.fork.mounted = true
+      if (!where.fork.includes(profile)) where.fork.push(profile)
       // 只认这一条自己的 config.enabled（第一个），不能只看「最后一条 enabled」——
       // fork 的 sop.enabled / aspects.* 里也各有 enabled，取最后一条会把 true 当成引擎开关。
       const idIndent = line.length - line.trimStart().length
@@ -371,7 +405,6 @@ function probeEngines() {
       }
     }
   }
-  result.conflict = result.selfcheck.mounted && result.fork.mounted && result.fork.enabled
   return result
 }
 

@@ -1,5 +1,46 @@
 # 更新日志
 
+## v1.7.1 — 2026-11-08
+
+**「装一次就完事」。** 反馈是「装了没人知道到底装没装对」——从前装这个插件要两步：一条命令装面板、再手拷 `engine/` 到 `~/.dsh/plugins/` 并手改 profile 的 patch 挂引擎。现在一条命令两个半侧一起装。
+
+### 一条命令装完两半
+
+```bash
+dsh plugin --profile web add https://github.com/wdj20050927/dsh-quality-guard/releases/download/v1.7.1/dsh-quality-guard-1.7.1.tgz
+```
+
+- `panel/cordis.patch.yml` 现在有两个 `insert` 块：面板（`- id: quality-guard` / `name: dsh-quality-guard`）+ 引擎（`- id: selfcheck-guard` / `name: ../engine/index.mjs`）。
+- 引擎的 `name:` 是**相对路径**，相对的是 patch 文件所在的 `panel/` 目录，所以 `../engine/index.mjs` 正好指向包内的引擎源码——不用绝对路径、不用拷文件、不用手改 patch。
+- `settingsFile` / `auditFile` 用 `!!js` 表达式现场按 `homedir()` 算，跨用户不用改。
+
+### 引擎目录单独成包名（`engine/package.json`）
+
+新增 `engine/package.json`，`name: dsh-quality-guard-engine`。**不这么做装不上**：面板声明了 `dsh.client`，`@deepseek-ai/dsh-client-modules` 的 `reconcilePackage()` 按包名去重，`nearestPackage()` 会从 `engine/index.mjs` 往上找最近的 `package.json`——root manifest 叫 `dsh-quality-guard`，和面板撞名，于是启动报
+
+```
+client-modules: package dsh-quality-guard resolves from multiple active Loader sources: "dsh-quality-guard" …, "…/engine/index.mjs" …
+dsh: startup failed: 1 required plugin did not activate
+```
+
+`engine/package.json` 就是 `nearestPackage()` 的停止点，两半从此不同包名。
+
+### 面板：引擎探测不再写死 `desktop` profile
+
+`panel/lib/settings.js` 里 `PROFILE_PATCH` 硬编码 `~/.dsh/profiles/desktop/cordis.patch.yml`。插件装到别的 profile（`web` / 市场建的任意 profile）时，面板读的是一个跟自己无关的文件，横幅会谎报「没有任何质检引擎在跑」。
+
+- 改为导出 `PROFILES_DIR`，`panel/lib/index.js` 的 `profilePatches()` 扫 `~/.dsh/profiles/*/cordis.patch.yml` 全部文件，`probeEngines()` 汇总并把命中的 profile 名记进 `selfcheck.profiles` / `fork.profiles`。
+- 页面横幅多一个「（挂在 desktop / web 里）」，说清是在哪找到的。
+
+### 文档
+
+- README「安装」整节重写：一条命令版 + 手动版，写明 Release tarball 绕开了什么（npm 上还没有这个包）、默认 `dryRun: true` 是演习模式、两个已知坑（`dsh.client` 同包名冲突、`package.json` 的 BOM）。
+- 自测数字从 `220 passed` 更正为 `234 passed, 0 failed`（README 里早就过时了）。
+
+### 重载
+
+装了新版要**重启一次 DSH**（引擎代码变了，同路径不热重载）。
+
 ## v1.7.0 — 2026-11-07
 
 **「给判官的提示词你也放在质检插件里让人可以随意修改」。** 之前决定判官松紧的两段字写死在 `engine/index.mjs` 里：system 消息（`JUDGE_SYSTEM`）和逐条打分规则/六档量表（`SCALE` + `scoreItemsPrompt` 里的规则块）。想收紧给分只能改代码、还要重启；这次把它们挪进 `settings.json`，和判据同等待遇。

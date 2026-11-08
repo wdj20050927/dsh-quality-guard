@@ -547,6 +547,9 @@ window.__ModuleLoader__.load({
         )
       }
       if (engines.selfcheck && engines.selfcheck.mounted) {
+        const where = Array.isArray(engines.selfcheck.profiles) && engines.selfcheck.profiles.length > 0
+          ? `（挂在 ${engines.selfcheck.profiles.join(' / ')} 里）`
+          : ''
         return h(
           'div',
           { className: 'qg-banner is-ok' },
@@ -556,6 +559,7 @@ window.__ModuleLoader__.load({
             null,
             h('b', null, '自研引擎 selfcheck-guard 在跑：'),
             '本页的改动写进 settings.json，引擎下一轮就按新的判——不用重载、不用重启。',
+            where,
           ),
         )
       }

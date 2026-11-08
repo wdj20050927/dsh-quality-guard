@@ -77,36 +77,66 @@ v1.4.0 起判官走**逐条 0-10 打分**：判据里只要有 ≥2 条编号条
 
 ## 安装
 
-### 0. 面板一条命令装（可选，先装这个也行）
+**一条命令，面板和引擎一起装上：**
 
 ```bash
-dsh plugin --profile web add github:wdj20050927/dsh-quality-guard
+dsh plugin --profile web add https://github.com/wdj20050927/dsh-quality-guard/releases/download/v1.7.1/dsh-quality-guard-1.7.1.tgz
 ```
 
-仓库根的 `package.json` 声明了 `dsh.bundle.patch: ./panel/cordis.patch.yml`，装完 dsh 会自动把 `quality-guard` 这一行插进你的 profile 层（`dsh --profile web --dump-config` 能看见 `- id: quality-guard`）。重启后侧边栏出现「质检」。
+把 `web` 换成你实际用的 profile 名（桌面版一般是 `desktop`）。装完重启 dsh，侧边栏出现「质检」，引擎也已经在跑——`package.json` 里的 `dsh.bundle.patch` 指向 `panel/cordis.patch.yml`，那个文件一次 `insert` 了两条：面板（`quality-guard`）和引擎（`selfcheck-guard`，`name: ../engine/index.mjs`，相对 patch 文件所在目录解析）。
 
-想先确认真的插进去了，装完跑 `dsh --profile web --dump-config`，输出里应当出现这两行：
+想确认真的插进去了：
+
+```bash
+dsh --profile web --dump-config
+```
+
+输出里应当出现两段：
 
 ```
 # == dsh-quality-guard
 - id: quality-guard
   name: dsh-quality-guard
+...
+- id: selfcheck-guard
+  name: >-
+    file:///.../node_modules/dsh-quality-guard/engine/index.mjs
 ```
 
-（只装了面板没装引擎也能跑，只是没有东西去读它写的设置。）
+### 为什么不用 npm 包名装
 
-引擎**不能**这样装——它要按绝对路径挂、要指你自己的配置路径，按下面第 1 节走。
+npm 上还没有这个包（`https://registry.npmjs.org/dsh-quality-guard` → 404）。上面那条是 GitHub Release 里预构建好的 tarball，`dsh plugin add` 认 `.tgz` 直链（`@deepseek-ai/dsh-plugin-manager` 的 `TARBALL_SPEC`），装出来的和 npm 包一模一样。
 
-### 1. 引擎（必须）
+`github:wdj20050927/dsh-quality-guard` 这种 git 装法也能装出面板，但不推荐：pnpm 从 git 装不跑 `prepack`，版本号会读成 `0.0.0`，而且上一次失败留下的目录联接会让重跑报 `ERR_PNPM_EPERM`。
+
+### 默认是演习模式
+
+装完 `dryRun: true`——只判断、只记日志（`~/.dsh/quality-guard/audit.jsonl`）、**不打回**。先看几天日志，确认判官判得对，再去面板把「演习模式」关掉。这是故意的：刚装上就真打回，你会被一条判据不合口味反复回炉。
+
+### 装在哪、怎么卸载
+
+插件进的是 `<profile>/node_modules/`，`dsh plugin --profile <name> remove dsh-quality-guard` 卸掉。验证用的临时 profile 直接删目录即可。
+
+---
+
+## 手动装（本机开发调试用）
+
+如果你在改这个仓库本身，需要让 dsh 直接用工作区里的实体文件：
 
 ```bash
-# 把 engine/ 整个拷到插件目录
-~/.dsh/plugins/selfcheck-guard/
+dsh plugin --profile <profile> add D:\path\to\dsh-quality-guard
 ```
 
-然后在你的 `~/.dsh/profiles/<profile>/cordis.patch.yml` 末尾追加一段 `insert`，把路径换成你自己的绝对路径（Windows 用正斜杠）：
+这会在 profile 的 `node_modules` 里建一个目录联接（Windows 上是 Junction），改代码立刻反映到下一次启动。
+
+手工挂载（dsh 版本不支持 `dsh.bundle` 时）：
 
 ```yaml
+# ~/.dsh/profiles/<profile>/cordis.patch.yml
+- insert:
+    - id: quality-guard
+      name: dsh-quality-guard
+
 - insert:
     - id: selfcheck-guard
       name: 'C:/Users/YOUR_NAME/.dsh/plugins/selfcheck-guard/index.mjs'
@@ -114,39 +144,20 @@ dsh plugin --profile web add github:wdj20050927/dsh-quality-guard
         settingsFile: 'C:/Users/YOUR_NAME/.dsh/quality-guard/settings.json'
         criteriaFile: 'C:/Users/YOUR_NAME/.dsh/plugins/selfcheck-guard/criteria.example.md'
         auditFile: 'C:/Users/YOUR_NAME/.dsh/quality-guard/audit.jsonl'
-        dryRun: true          # 先演习，只记日志不打回
+        dryRun: true
         maxReworks: 3
         timeoutMs: 60000
         # 输出预算由引擎按档位自动算，别填 maxTokens（填数字＝关掉自动预算）
 ```
 
-完整示例见 [`examples/cordis.patch.example.yml`](examples/cordis.patch.example.yml)。改完重启 dsh（或重载 patch）。
+完整示例见 [`examples/cordis.patch.example.yml`](examples/cordis.patch.example.yml)。
 
-`settings.json` 不存在也没关系：引擎会用 patch 里的静态配置 + `criteriaFile` 开跑。
+`settings.json` 不存在也没关系：首次加载面板会写一份默认值，引擎也会退到 patch 里的静态配置 + `criteriaFile`。
 
-### 2. 面板（可选）
+**两个已知坑**（都是实测踩出来的）：
 
-**推荐**：见上面第 0 节，一条 `dsh plugin` 命令搞定。
-
-手动装（本机开发时调试实体文件用，或者你的 dsh 版本不支持 `dsh.bundle`）：
-
-```bash
-# 拷到插件目录
-~/.dsh/plugins/dsh-quality-guard/
-
-# 在 profile 的 node_modules 里建目录联接（Windows）
-cmd /c mklink /J "%USERPROFILE%\.dsh\profiles\<profile>\node_modules\dsh-quality-guard" "%USERPROFILE%\.dsh\plugins\dsh-quality-guard"
-```
-
-patch 里再追加一条按**包名**挂的：
-
-```yaml
-- insert:
-    - id: quality-guard
-      name: dsh-quality-guard
-```
-
-面板需要 `react ^18.2` 和 `@deepseek-ai/dsh-client-locale`、`@deepseek-ai/dsh-client-ui-layout`（后两个 dsh 自带）。重启后侧边栏出现「质检」。
+1. **同一份 `package.json` 名字不能给两半共用。** 面板声明了 `dsh.client`，引擎是路径挂载；`@deepseek-ai/dsh-client-modules` 的 `reconcilePackage()` 按包名去重，两半同包名会报 `resolves from multiple active Loader sources` 并让 `dsh-client-modules` 这个 required 插件启不来。所以 `engine/package.json` 单独叫 `dsh-quality-guard-engine`——它是 `nearestPackage()` 向上找 package.json 的停止点。
+2. **`package.json` 不能带 BOM。** 用 PowerShell `Set-Content -Encoding utf8` 手写会加 `EF BB BF`，dsh 报 `SyntaxError: Unexpected token '﻿'` 并整个跳过这个 bundle。
 
 ---
 
@@ -241,7 +252,7 @@ patch 里再追加一条按**包名**挂的：
 
 ```bash
 node engine/selftest.mjs
-# → 220 passed, 0 failed
+# → 234 passed, 0 failed
 ```
 
 用假 llm，不联网、不花钱，覆盖：判据拼装、超时/报错放行、`maxReworks` 上限、`dryRun`、外部判据文件、活动设置覆盖 patch、v1.0.1 的三种判官异常（JSON 全在 reasoning、`aborted`、`max-tokens` 空产出）与审计诊断字段，v1.1.0 的分层抢救（行式 / 完整 JSON / 截断 JSON / 只给 verdict）、补判、unknown 出口、`onUnknown=rework`，思考档位（v1.2.0 默认 `low` / 可配 / 非法值 / 被上游拒绝自动退回 / 真错误不误判），v1.3.0 的自动档位与自动预算（`auto` 起步、判不出来才升级、预算随档位一起涨、旧值保存时归一），v1.4.0 的逐条 0-10 打分（全满分 / 部分失分 / 硬门槛 / 漏答压分母 / 越界分当未答 / 分号与全角冒号容错 / 截断仍能判 / 非数字输出走 unknown / `checks` 记分数与编号），以及 v1.5.0 的一票否决（任一条 <6 即 fail / 6 分不触发 / 折算 59 / 低分真回炉）。
