@@ -80,7 +80,7 @@ v1.4.0 起判官走**逐条 0-10 打分**：判据里只要有 ≥2 条编号条
 **一条命令，面板和引擎一起装上：**
 
 ```bash
-dsh plugin --profile web add https://github.com/wdj20050927/dsh-quality-guard/releases/download/v1.7.1/dsh-quality-guard-1.7.1.tgz
+dsh plugin --profile web add https://github.com/wdj20050927/dsh-quality-guard/releases/download/v1.7.2/dsh-quality-guard-1.7.2.tgz
 ```
 
 把 `web` 换成你实际用的 profile 名（桌面版一般是 `desktop`）。装完重启 dsh，侧边栏出现「质检」，引擎也已经在跑——`package.json` 里的 `dsh.bundle.patch` 指向 `panel/cordis.patch.yml`，那个文件一次 `insert` 了两条：面板（`quality-guard`）和引擎（`selfcheck-guard`，`name: ../engine/index.mjs`，相对 patch 文件所在目录解析）。

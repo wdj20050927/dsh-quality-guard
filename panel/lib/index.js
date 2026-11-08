@@ -331,6 +331,10 @@ async function withTitles(rows) {
  * v1.7.1：扫 `~/.dsh/profiles/*` 下所有 profile，而不是写死 `desktop`。
  * 引擎可能挂在任意一个 profile 里（插件自己装到 `web` 也会挂），只认一个目录会误报「没引擎在跑」。
  * 返回 `patchFiles` 让页面能说清是在哪个文件里找到的。
+ *
+ * v1.7.2：除了 profile 自己的 `cordis.patch.yml`，还要读**装进那个 profile 的 bundle 自带的 patch**——
+ * 一条命令装完时引擎是 bundle patch 挂的，profile 那个文件里根本没有 `- id: selfcheck-guard`，
+ * 只扫 profile 会给刚装好的人报「没有引擎在跑」。
  */
 function profilePatches() {
   const found = []
@@ -341,11 +345,20 @@ function profilePatches() {
     return found
   }
   for (const profile of names.sort()) {
-    const file = join(PROFILES_DIR, profile, 'cordis.patch.yml')
+    const dir = join(PROFILES_DIR, profile)
+    const own = join(dir, 'cordis.patch.yml')
     try {
-      if (statSync(file).isFile()) found.push({ profile, file, text: readFileSync(file, 'utf8') })
+      if (statSync(own).isFile()) found.push({ profile, file: own, text: readFileSync(own, 'utf8') })
     } catch {
       // 这个 profile 没有 patch 文件，跳过。
+    }
+    const bundled = join(dir, 'node_modules', 'dsh-quality-guard', 'panel', 'cordis.patch.yml')
+    try {
+      if (statSync(bundled).isFile()) {
+        found.push({ profile, file: bundled, text: readFileSync(bundled, 'utf8') })
+      }
+    } catch {
+      // 这个 profile 没装本插件，跳过。
     }
   }
   return found

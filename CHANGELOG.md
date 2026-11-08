@@ -1,5 +1,15 @@
 # 更新日志
 
+## v1.7.2 — 2026-11-08
+
+修上一个版本自带的谎报：**刚装好的人会看到「没有引擎在跑」**。
+
+### 引擎探测要读 bundle 自带的 patch
+
+v1.7.1 之后引擎是**包自带 patch** 挂上去的（`node_modules/dsh-quality-guard/panel/cordis.patch.yml` 里那条 `- id: selfcheck-guard`），profile 自己的 `cordis.patch.yml` 里压根没有这一行。而 `profilePatches()` 只读 `<profile>/cordis.patch.yml`，于是全新装好的 profile 里 `engines.selfcheck.mounted` 是 `false`——引擎明明在跑，面板却说没跑。
+
+现在每个 profile 读两份：自己的 `cordis.patch.yml` + `node_modules/dsh-quality-guard/panel/cordis.patch.yml`。命中任一份就算挂载，`profiles` 里记是哪个 profile。
+
 ## v1.7.1 — 2026-11-08
 
 **「装一次就完事」。** 反馈是「装了没人知道到底装没装对」——从前装这个插件要两步：一条命令装面板、再手拷 `engine/` 到 `~/.dsh/plugins/` 并手改 profile 的 patch 挂引擎。现在一条命令两个半侧一起装。
