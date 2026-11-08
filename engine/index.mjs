@@ -88,7 +88,7 @@
  *    相关的项（「保持可爱的某某人设」「结论要量化打分」）在无关的技术答复上恒判 no，
  *    把本该 100 分的回复压到 60（生产审计：第 4 条 no 20 次、第 5 条 18 次，24 次打回里 8 次
  *    由此产生）。加 `na` 第三态只能救急——用户随时改判据，程序不可能预知哪条会不适用。
- *    ⇒ 每条判据各拿一个 0-10 分（`SCALE` 六档锚点写死在提示里），「客观加不了打 10、
+ *    ⇒ 每条判据各拿一个 0-10 分（`DEFAULT_JUDGE_RULES` 六档锚点，能在 settings.json 里改），「客观加不了打 10、
  *    主观没加拉低」变成提示里的一条规则而不是第三种答案。实测同一回复各判 4 次，
  *    总分极差 good 8 / mid 6 / bad 5（平均 6.3），`temperature: 0` 反而更抖（9.7）。
  */
@@ -183,7 +183,7 @@ const GUARD_SOURCE = { kind: 'plugin:selfcheck-guard' }
  * 所以把「宁可判不合格」换成「判据没写的不算违规」：
  * 判据本身就是用户的原话，判官只负责核对，不该自己加戏。
  */
-const JUDGE_SYSTEM = [
+export const DEFAULT_JUDGE_SYSTEM = [
   '你是一个质检员。你面前有「用户的问题」和「助手即将发出的回复」。',
   '你不评价内容是否正确、是否充分，只判定这段回复**读起来是否符合用户给出的判据**。',
   '判据没写的要求不算违规；判据的前提在本轮不成立时（比如回复里没出现数值、用户只问了一个问题），该条算满足。',
@@ -342,21 +342,31 @@ function labelOf(item) {
 }
 
 /**
- * 逐条 0-10 打分的锚点量表。
- *
- * v1.4.0 的第三次改法：yes/no 被用户否掉了（「用户随时会去调整质检词，你不知道哪几条要打分、
- * 哪几条要 yes/no」），所以每条判据都拿到一个 0-10 的分，由程序折算总分。
- * 量表必须把每一档的判据写死，否则判官会自由心证——实测同一段回复连判 4 次，
- * 只有量表锚定得够硬，总分极差才压在 5~8（见 `.scratch/probe-score10-out.txt`）。
+ * v1.7.0：出厂默认的「打分规则 + 六档量表」。之前叫 SCALE、写死在 scoreItemsPrompt 里，
+ * 现在整段放进 settings.json 的 judgeRules 字段——框里、文件里、判官实际用的都是这一份全文。
+ * 这个常量只在首次生成 settings.json / 点「恢复默认」时写进去；判官每轮只读 settings.json。
+ * 输出格式骨架（第一行「编号:分数」、第二行 FIX:）仍写死在 scoreItemsPrompt 里，不给改。
  */
-const SCALE = [
+export const DEFAULT_JUDGE_RULES = [
+  '请逐条给上面每一条判据打分，0 到 10 的整数。',
+  '',
+  '打分前先分清两件事，这是唯一容易判错的地方：',
+  '- **客观加不了**：这一条在本轮根本没有判定对象。例：判据要求给数值标出处，而回复里一个数值都没有；判据要求人设不许前后矛盾，而这段是纯技术答复、通篇没有自称和称呼；判据要求给结论的重要性量化打分，而这段通篇没有给出任何结论；判据要求「多个问句逐条对应」，而用户只问了一句。',
+  '  这种情况打 **10**，不扣分——不是它做得差，是没东西可做。',
+  '- **主观没加**：这一条有判定对象，但回复没做到或只做到一半。哪怕只找到一句能指出来的问题，也按下面的量表扣分，不许拿「不太适用」当借口送 10 分。',
+  '',
+  '量表，每一档都有硬判据，对号入座：',
   '- 10 分：完全做到，找不到一句要改的（或客观加不了，见上）。',
   '- 8 分：基本做到，只有措辞上的小瑕疵。',
   '- 6 分：做到一半，明显缺了东西。',
   '- 4 分：大多没做到，只能算沾边。',
   '- 2 分：基本没做到。',
   '- 0 分：明确违反，并且你能指出具体是哪一句。',
-]
+  '',
+  '- 第 1 条永远有判定对象（任何回复都有开头），不许按「客观加不了」打 10。',
+  '- **任何一条低于 6 分，整条回复直接不合格**，不管你给总分打了多少。所以别为了「总分好看」把明显缺东西的条打到 8 分——6 分以下就是该打 6 分以下。',
+  '- 也不许拿低分当报复：指不出具体哪一句违反，就按「客观加不了」打 10。',
+].join('\n')
 
 /**
  * 逐条打分的提示：让判官给每条判据一个 0-10 的整数，**得分压在一行里放在最前面**。
@@ -368,7 +378,7 @@ const SCALE = [
  * 逐条 0-10 实测：good/mid/bad 各 4 次，总分极差 8/6/5，好 76~88、坏 35~42 分得开。
  * 得分放第一行是 v5「分数第一行」那招的复用：截断只吃尾巴。
  */
-function scoreItemsPrompt(question, reply, criteria, items, brief = false) {
+function scoreItemsPrompt(question, reply, criteria, items, brief = false, judgeRules = DEFAULT_JUDGE_RULES) {
   const clip = (text, limit) => (text.length <= limit ? text : `${text.slice(0, limit)}\n……（后略 ${text.length - limit} 字）`)
   // 示例的满分项留 8 不给 10：整行都对 10 的样例会训练判官当橡皮图章（v1.4.0 实测）。
   const sample = items.map((item, index) => `${item.id}:${index === 0 ? 8 : 10}`).join(' ')
@@ -381,19 +391,7 @@ function scoreItemsPrompt(question, reply, criteria, items, brief = false) {
     '',
     criteria,
     '',
-    '请逐条给上面每一条判据打分，0 到 10 的整数。',
-    '',
-    '打分前先分清两件事，这是唯一容易判错的地方：',
-    '- **客观加不了**：这一条在本轮根本没有判定对象。例：判据要求给数值标出处，而回复里一个数值都没有；判据要求人设不许前后矛盾，而这段是纯技术答复、通篇没有自称和称呼；判据要求给结论的重要性量化打分，而这段通篇没有给出任何结论；判据要求「多个问句逐条对应」，而用户只问了一句。',
-    '  这种情况打 **10**，不扣分——不是它做得差，是没东西可做。',
-    '- **主观没加**：这一条有判定对象，但回复没做到或只做到一半。哪怕只找到一句能指出来的问题，也按下面的量表扣分，不许拿「不太适用」当借口送 10 分。',
-    '',
-    '量表，每一档都有硬判据，对号入座：',
-    ...SCALE,
-    '',
-    '- 第 1 条永远有判定对象（任何回复都有开头），不许按「客观加不了」打 10。',
-    '- **任何一条低于 6 分，整条回复直接不合格**，不管你给总分打了多少。所以别为了「总分好看」把明显缺东西的条打到 8 分——6 分以下就是该打 6 分以下。',
-    '- 也不许拿低分当报复：指不出具体哪一句违反，就按「客观加不了」打 10。',
+    judgeRules,
     '',
     '然后严格按下面的格式输出。',
     `第一行必须是全部得分，格式为「编号:分数」，用空格隔开，一条都不许漏，例如：${sample}`,
@@ -690,7 +688,7 @@ async function runJudge(llm, route, promptText, settings, parse = parseVerdict, 
     const options = {
       provider: route.provider,
       model: route.model,
-      system: JUDGE_SYSTEM,
+      system: settings.judgeSystem ?? DEFAULT_JUDGE_SYSTEM,
       messages: [{ role: 'user', content: [{ type: 'text', text: promptText }] }],
       maxTokens: budget,
       signal: controller.signal,
@@ -1063,6 +1061,10 @@ export function apply(ctx, config) {
   }
   const pickBool = (value, fallback) => (typeof value === 'boolean' ? value : fallback)
 
+  /** v1.7.0：判官提示词字段。面板保证 settings.json 里永远是非空全文；
+   *  这里只在老配置缺字段 / 文件被手改坏时兜底用出厂默认，避免判官拿不到 system。 */
+  const pickPrompt = (value, fallback) => (typeof value === 'string' && value.trim() !== '' ? value : fallback)
+
   /**
    * 活设置里的 `judge.maxTokens` 怎么落到 live 上。
    *  - 活设置有数字 → 那个数字（逃生舱，面板已不再暴露这个框）；
@@ -1129,6 +1131,8 @@ export function apply(ctx, config) {
         })(),
         model: model ?? settings.model,
         auditFile: typeof parsed.auditFile === 'string' ? parsed.auditFile : settings.auditFile,
+        judgeSystem: pickPrompt(parsed.judgeSystem, DEFAULT_JUDGE_SYSTEM),
+        judgeRules: pickPrompt(parsed.judgeRules, DEFAULT_JUDGE_RULES),
         ...(() => {
           if (!Array.isArray(parsed.criteria)) return { criteria: criteriaText(), criteriaLabels: [] }
           const composed = composeLiveCriteria(parsed.criteria, parsed.exceptions)
@@ -1147,7 +1151,7 @@ export function apply(ctx, config) {
   const liveNow = () => {
     const fromFile = readLive()
     if (fromFile !== null) return fromFile
-    return { ...settings, criteria: criteriaText(), criteriaLabels: [] }
+    return { ...settings, criteria: criteriaText(), criteriaLabels: [], judgeSystem: DEFAULT_JUDGE_SYSTEM, judgeRules: DEFAULT_JUDGE_RULES }
   }
 
   // ── v1.3.1：跨轮记住「这个路由不认档位」，别再每轮白撞一次 ──────────────
@@ -1228,7 +1232,7 @@ export function apply(ctx, config) {
           return runJudge(
             llm,
             route,
-            scoreItemsPrompt(exchange.question, exchange.reply, live.criteria, items, brief),
+            scoreItemsPrompt(exchange.question, exchange.reply, live.criteria, items, brief, live.judgeRules),
             live,
             (text) => scoreVerdict(text, items, live.scoreThreshold),
             effortState,

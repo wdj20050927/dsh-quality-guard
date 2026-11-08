@@ -59,6 +59,35 @@ export const DEFAULT_EXCEPTIONS = [
   '用户在赶时间、只要一个数或一个名字 → 多一句解释就算违规。',
 ].join('\n')
 
+/** v1.7.0：判官提示词的出厂默认，跟 engine/index.mjs 里的常量逐字一致（避免跨包 import）。 */
+export const DEFAULT_JUDGE_SYSTEM = [
+  '你是一个质检员。你面前有「用户的问题」和「助手即将发出的回复」。',
+  '你不评价内容是否正确、是否充分，只判定这段回复**读起来是否符合用户给出的判据**。',
+  '判据没写的要求不算违规；判据的前提在本轮不成立时（比如回复里没出现数值、用户只问了一个问题），该条算满足。',
+  '判不合格必须能指出回复里具体是哪句话违反了哪条判据；指不出具体句子就判合格。',
+].join('\n')
+
+export const DEFAULT_JUDGE_RULES = [
+  '请逐条给上面每一条判据打分，0 到 10 的整数。',
+  '',
+  '打分前先分清两件事，这是唯一容易判错的地方：',
+  '- **客观加不了**：这一条在本轮根本没有判定对象。例：判据要求给数值标出处，而回复里一个数值都没有；判据要求人设不许前后矛盾，而这段是纯技术答复、通篇没有自称和称呼；判据要求给结论的重要性量化打分，而这段通篇没有给出任何结论；判据要求「多个问句逐条对应」，而用户只问了一句。',
+  '  这种情况打 **10**，不扣分——不是它做得差，是没东西可做。',
+  '- **主观没加**：这一条有判定对象，但回复没做到或只做到一半。哪怕只找到一句能指出来的问题，也按下面的量表扣分，不许拿「不太适用」当借口送 10 分。',
+  '',
+  '量表，每一档都有硬判据，对号入座：',
+  '- 10 分：完全做到，找不到一句要改的（或客观加不了，见上）。',
+  '- 8 分：基本做到，只有措辞上的小瑕疵。',
+  '- 6 分：做到一半，明显缺了东西。',
+  '- 4 分：大多没做到，只能算沾边。',
+  '- 2 分：基本没做到。',
+  '- 0 分：明确违反，并且你能指出具体是哪一句。',
+  '',
+  '- 第 1 条永远有判定对象（任何回复都有开头），不许按「客观加不了」打 10。',
+  '- **任何一条低于 6 分，整条回复直接不合格**，不管你给总分打了多少。所以别为了「总分好看」把明显缺东西的条打到 8 分——6 分以下就是该打 6 分以下。',
+  '- 也不许拿低分当报复：指不出具体哪一句违反，就按「客观加不了」打 10。',
+].join('\n')
+
 /** 默认设置：跟 selfcheck-guard 的出厂默认一致（dryRun=true，先演习）。 */
 export function defaults() {
   return {
@@ -78,6 +107,8 @@ export function defaults() {
     reasoningEffort: 'default',
     criteria: DEFAULT_CRITERIA.map((item) => ({ ...item })),
     exceptions: DEFAULT_EXCEPTIONS,
+    judgeSystem: DEFAULT_JUDGE_SYSTEM,
+    judgeRules: DEFAULT_JUDGE_RULES,
     auditFile: AUDIT_FILE.replace(/\\/g, '/'),
     updatedAt: null,
   }
@@ -98,10 +129,13 @@ export const FIELD_HELP = {
   timeoutMs: '已停用：v1.4.0 起判官不再自己设截止，等上游回话为止。',
   criteria: '判官手里那张尺子。勾掉＝这一条不再检查。',
   exceptions: '例外情形：写在这里的，判官不按上面的判据算违规。一行一条。',
+  judgeSystem: '判官的 system 消息（它是谁、只管什么、什么算违规）。框里就是判官实际用的全文，改完下一轮生效；不能留空。',
+  judgeRules: '逐条打分的规则 + 六档量表。框里就是判官实际用的全文，想收紧给分就改这里；不能留空。',
 }
 
 const MAX_TEXT = 2000
 const MAX_EXCEPTIONS = 4000
+const MAX_JUDGE_PROMPT = 20000
 
 function fail(message) {
   const error = new Error(message)
@@ -185,6 +219,19 @@ export function normalize(input) {
     ? 'default'
     : EFFORT_VALUES.includes(rawEffort) ? rawEffort : base.reasoningEffort
 
+/** v1.7.0：判官提示词两个字段。框里＝settings.json 里＝判官实际用的，三者逐字一致，不允许留空。
+ *  只有「老版 settings.json 还没这两个字段」时才用出厂默认全文补齐（升级兼容，不是留空）。
+ *  要恢复出厂默认请点面板的「恢复默认」，它会把默认全文重新写进 settings.json。 */
+  const pickJudgePrompt = (value, label, fallback) => {
+    if (value === undefined || value === null) return fallback
+    if (typeof value !== 'string') fail(`${label} 必须是文本`)
+    if (value.trim() === '') fail(`${label} 不能留空：框里就是判官实际用的全文；要恢复出厂默认请点右上角的「恢复默认」`)
+    if (value.length > MAX_JUDGE_PROMPT) fail(`${label} 太长（上限 ${MAX_JUDGE_PROMPT} 字）`)
+    return value
+  }
+  const judgeSystem = pickJudgePrompt(input.judgeSystem, '判官 system 提示词', DEFAULT_JUDGE_SYSTEM)
+  const judgeRules = pickJudgePrompt(input.judgeRules, '判官打分规则', DEFAULT_JUDGE_RULES)
+
   return {
     version: 1,
     enabled: pickBool(input.enabled, '总开关', base.enabled),
@@ -204,6 +251,8 @@ export function normalize(input) {
     onUnknown: input.onUnknown === 'rework' ? 'rework' : input.onUnknown === 'pass' ? 'pass' : base.onUnknown,
     // v1.4.0：默认 'default'＝一个字节都不发档位；'auto' 是老别名，归一过来。
     reasoningEffort,
+    judgeSystem,
+    judgeRules,
     auditFile: auditFile.replace(/\\/g, '/'),
     updatedAt: typeof input.updatedAt === 'string' ? input.updatedAt : null,
   }

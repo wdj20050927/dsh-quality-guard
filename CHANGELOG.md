@@ -1,5 +1,36 @@
 # 更新日志
 
+## v1.7.0 — 2026-11-07
+
+**「给判官的提示词你也放在质检插件里让人可以随意修改」。** 之前决定判官松紧的两段字写死在 `engine/index.mjs` 里：system 消息（`JUDGE_SYSTEM`）和逐条打分规则/六档量表（`SCALE` + `scoreItemsPrompt` 里的规则块）。想收紧给分只能改代码、还要重启；这次把它们挪进 `settings.json`，和判据同等待遇。
+
+### 新增两个设置字段（都可在面板里编辑）
+
+- `judgeSystem`：判官的 system 提示词。
+- `judgeRules`：逐条打分的规则 + 0/2/4/6/8/10 六档锚点量表。
+- 两者是**顶层字符串**，落在 `~/.dsh/quality-guard/settings.json`；引擎 `readLive()` 每轮现读（`mtimeMs:size` 缓存），**改完下一轮就生效，不用重启**。**没有「留空＝默认」**：框里、`settings.json` 里、判官实际用的始终是同一份全文，两个框都不允许留空（面板前后端都拦），上限各 20000 字。想恢复出厂默认点面板「恢复默认」，它把默认全文写回 `settings.json`。引擎 `pickPrompt()` 只在老配置缺字段 / 文件被手改坏时兜底。
+- **输出格式骨架写死不给改**：`scoreItemsPrompt` 里「第一行 `编号:分数`、第二行 `FIX:`」及问答/判据拼装留在代码里，只把中间规则块换成参数 `judgeRules`。理由：`parseScores()` 靠这个格式解析，放开让人改坏会整轮判不出来。占位符方案弃用（零学习成本）。
+
+### 引擎 `engine/index.mjs`
+
+- `JUDGE_SYSTEM` → `export const DEFAULT_JUDGE_SYSTEM`；删 `SCALE`，规则块 + 量表合成 `export const DEFAULT_JUDGE_RULES`（文字逐字照抄，行为不变）。
+- `runJudge()` 的 `system` 改 `settings.judgeSystem ?? DEFAULT_JUDGE_SYSTEM`；`scoreItemsPrompt(..., judgeRules = DEFAULT_JUDGE_RULES)` 第 6 参由 `live.judgeRules` 传入。
+- `readLive()` 加 `pickPrompt()` 读两个新字段；`liveNow()` 的回退对象补齐两字段。
+- **行为中性**：两个字段用出厂默认全文 seed 进 `settings.json`，发给判官的字节与 v1.6.1 完全一致。
+
+### 面板
+
+- `panel/lib/settings.js`：`DEFAULT_JUDGE_SYSTEM` / `DEFAULT_JUDGE_RULES`（与引擎逐字一致）、`defaults()` / `normalize()` / `FIELD_HELP` 同步带上两字段（否则面板一保存就把新字段抹掉——`normalize()` 的未知字段丢弃规矩）。
+- `panel/lib/client.js`：「什么情况不算违规」之后新增「判官提示词」一节，两个 textarea（系统提示 rows 5、打分规则 rows 12）；`toDraft()` / `fromDraft()` 带上两字段，`patchDraft()` 靠 `...current` 自动带过。
+
+### 自测 `engine/selftest.mjs`
+
+- 新增 3 例：默认走内置常量且格式骨架仍在；`settings.json` 自定义两字段生效且不再带内置规则；同一进程内热改 `settings.json`，第 2 轮就读到新提示词（破 `mtimeMs:size` 缓存）。
+
+### 重载
+
+- 引擎换了代码：**重启一次 DSH**（同路径改不重载，disable/enable 无效）。重启之后随便改提示词，再不重启。面板前端刷新页面（F5）看新框。
+
 ## v1.6.1 — 2026-11-05
 
 **装了没人知道 = 没写。** 起因是查自己仓库的数据：1 个 star（本人点的）、外部 referrer 为 0、clone 全是自己的开发循环。功能没问题，问题是它进不了任何市场——三个 dsh 市场（dsh-market / dshget.com / plugin.dshx.dev）都从 `awesome-dsh-plugin/awesome-dsh-plugin` 同步，而那条收录流水线在 CI 里卡一条硬门槛：**`package.json` 必须在仓库根，或在 `packages/ packages/ plugins/ apps/` 子包里声明 `dsh.bundle`**。本仓库此前只有 `panel/package.json`，根上没有，等于永远进不去。

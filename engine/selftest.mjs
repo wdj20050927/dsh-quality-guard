@@ -6,7 +6,7 @@
  */
 
 import fs from 'node:fs'
-import { apply, name, JUDGE_MAX_TOKENS, AUTO_START } from './index.mjs'
+import { apply, name, JUDGE_MAX_TOKENS, AUTO_START, DEFAULT_JUDGE_SYSTEM, DEFAULT_JUDGE_RULES } from './index.mjs'
 
 let passed = 0
 let failed = 0
@@ -1412,6 +1412,91 @@ const checklistHarness = (llm, config = {}) => {
   check('审计不再有 na 字段', row.naCount === undefined && row.applicable === undefined && row.naSuspicious === undefined, JSON.stringify(row))
   h.cleanup()
   fs.unlinkSync(audit)
+}
+
+
+// 73. v1.7.0：判官提示词默认走内置常量，且输出格式骨架仍在
+{
+  const llm = fakeLlm('1:10 2:10 3:10\nFIX: 无需改动')
+  const h = checklistHarness(llm)
+  await h.stop()
+  const sys = llm.calls[0]?.system ?? ''
+  const prompt = String(llm.calls[0]?.messages?.[0]?.content?.[0]?.text ?? '')
+  check('默认 system 用内置 DEFAULT_JUDGE_SYSTEM', sys === DEFAULT_JUDGE_SYSTEM, sys.slice(0, 60))
+  check('默认规则含「客观加不了」', prompt.includes('客观加不了'))
+  check('默认规则逐字等于 DEFAULT_JUDGE_RULES', prompt.includes(DEFAULT_JUDGE_RULES))
+  check('默认规则含六档量表', prompt.includes('- 10 分：完全做到'))
+  check('输出格式骨架仍在（第一行编号:分数）', prompt.includes('第一行必须是全部得分'))
+  h.cleanup()
+}
+
+// 74. v1.7.0：settings.json 里的 judgeSystem / judgeRules 生效
+{
+  const settingsFile = `${process.env.TEMP ?? '/tmp'}/selfcheck-settings-prompt-${Date.now()}-${Math.random().toString(36).slice(2)}.json`
+  const audit = tmpFile('audit-live-prompt')
+  const llm = fakeLlm('1:10 2:10 3:10\nFIX: 无需改动')
+  fs.writeFileSync(settingsFile, JSON.stringify({
+    dryRun: false,
+    triggers: { minReplyChars: 0, maxReworks: 3, scoreThreshold: 80 },
+    judge: { timeoutMs: 60000, model: null },
+    onUnknown: 'rework',
+    reasoningEffort: 'low',
+    criteria: [
+      { id: 'a', label: '甲', enabled: true, text: '最核心的那一条放在最前面直接给出。' },
+      { id: 'b', label: '乙', enabled: true, text: '用最简单最直白的话说。' },
+      { id: 'c', label: '丙', enabled: true, text: '不旁生枝节。' },
+    ],
+    exceptions: '',
+    judgeSystem: 'MARK_SYSTEM_7788',
+    judgeRules: 'MARK_RULES_8899',
+    auditFile: audit,
+  }), 'utf8')
+  const h = harness({ dryRun: false, settingsFile, auditFile: audit }, llm, baseEvents)
+  await h.stop()
+  const sys = llm.calls[0]?.system ?? ''
+  const prompt = String(llm.calls[0]?.messages?.[0]?.content?.[0]?.text ?? '')
+  check('自定义 judgeSystem 生效', sys === 'MARK_SYSTEM_7788', sys.slice(0, 60))
+  check('自定义 judgeRules 生效', prompt.includes('MARK_RULES_8899'))
+  check('自定义时不再带内置规则', !prompt.includes('客观加不了'))
+  check('自定义时输出格式骨架仍在', prompt.includes('第一行必须是全部得分'))
+  fs.rmSync(settingsFile, { force: true })
+  fs.rmSync(audit, { force: true })
+}
+
+// 75. v1.7.0：同一进程内热改 settings.json，下一轮就读到新提示词（不用重启）
+{
+  const settingsFile = `${process.env.TEMP ?? '/tmp'}/selfcheck-settings-hot-${Date.now()}-${Math.random().toString(36).slice(2)}.json`
+  const audit = tmpFile('audit-live-prompt-hot')
+  const llm = fakeLlm('1:10 2:10 3:10\nFIX: 无需改动')
+  const make = (sys, rules) => JSON.stringify({
+    dryRun: false,
+    triggers: { minReplyChars: 0, maxReworks: 3, scoreThreshold: 80 },
+    judge: { timeoutMs: 60000, model: null },
+    onUnknown: 'rework',
+    criteria: [
+      { id: 'a', label: '甲', enabled: true, text: '最核心的那一条放在最前面直接给出。' },
+      { id: 'b', label: '乙', enabled: true, text: '用最简单最直白的话说。' },
+      { id: 'c', label: '丙', enabled: true, text: '不旁生枝节。' },
+    ],
+    exceptions: '',
+    judgeSystem: sys,
+    judgeRules: rules,
+    auditFile: audit,
+  })
+  fs.writeFileSync(settingsFile, make('HOT_SYS_A', 'HOT_RULES_A'), 'utf8')
+  const h = harness({ dryRun: false, settingsFile, auditFile: audit }, llm, baseEvents)
+  await h.stop(1)
+  // 换个长度的字符串，确保 mtimeMs:size 的缓存 key 变化。
+  fs.writeFileSync(settingsFile, make('HOT_SYS_B_LONGER', 'HOT_RULES_B_LONGER'), 'utf8')
+  await h.stop(2)
+  const sys1 = llm.calls[0]?.system ?? ''
+  const sys2 = llm.calls[1]?.system ?? ''
+  const prompt2 = String(llm.calls[1]?.messages?.[0]?.content?.[0]?.text ?? '')
+  check('第 1 轮读到 A', sys1 === 'HOT_SYS_A', sys1)
+  check('第 2 轮热改后读到 B，不用重启', sys2 === 'HOT_SYS_B_LONGER', sys2)
+  check('第 2 轮规则也热改', prompt2.includes('HOT_RULES_B_LONGER'))
+  fs.rmSync(settingsFile, { force: true })
+  fs.rmSync(audit, { force: true })
 }
 
 console.log(`\n${passed} passed, ${failed} failed`)

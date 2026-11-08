@@ -1,6 +1,6 @@
 {
   "name": "dsh-quality-guard",
-  "version": "1.6.1",
+  "version": "1.7.0",
   "private": true,
   "description": "发消息之前，先让另一个模型读一遍：dsh 插件组合（引擎 hooks + 可视化质检面板）。",
   "type": "module",

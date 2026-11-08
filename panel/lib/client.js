@@ -308,6 +308,8 @@ window.__ModuleLoader__.load({
         },
         criteria: settings.criteria.map((item) => ({ ...item })),
         exceptions: settings.exceptions,
+        judgeSystem: settings.judgeSystem ?? '',
+        judgeRules: settings.judgeRules ?? '',
         onUnknown: settings.onUnknown === 'rework' ? 'rework' : 'pass',
         reasoningEffort: settings.reasoningEffort ?? 'default',
       }
@@ -320,6 +322,13 @@ window.__ModuleLoader__.load({
         if (!Number.isFinite(value) || !Number.isInteger(value)) throw new Error(`${name} 要填整数`)
         if (value < min || value > max) throw new Error(`${name} 要在 ${min}~${max} 之间`)
         return value
+      }
+      // v1.7.0：框里＝判官实际用的全文，不允许留空（后端 normalize 也会再拦一道）。
+      const requireJudgePrompt = (raw, label) => {
+        if (typeof raw !== 'string' || raw.trim() === '') {
+          throw new Error(`${label} 不能留空：框里就是判官实际用的全文；要恢复出厂默认请点右上角的「恢复默认」`)
+        }
+        return raw
       }
       const criteria = draft.criteria
         .filter((item) => item.text.trim() !== '')
@@ -345,6 +354,8 @@ window.__ModuleLoader__.load({
         },
         criteria,
         exceptions: draft.exceptions,
+        judgeSystem: requireJudgePrompt(draft.judgeSystem, '判官 system 提示词'),
+        judgeRules: requireJudgePrompt(draft.judgeRules, '判官打分规则'),
         onUnknown: draft.onUnknown === 'rework' ? 'rework' : 'pass',
         // v1.4.0：档位由人挑，'default' ＝ 一个字节都不发（老版本的 'auto' 已被归一到它）。
         reasoningEffort: draft.reasoningEffort,
@@ -389,6 +400,8 @@ window.__ModuleLoader__.load({
       judgeAuto: '默认一个字节都不发，让这家 API 用它自己的默认档；只有你想强行压低时才挑一档。输出上限固定 32768，不用填。',
       judgeModel: '跟当前会话同一条线＝不指定，让判官走你正在用的那条模型；也可以从下拉里挑一个别的。',
       timeoutMs: 'v1.4.0 起判官不再自己设截止，等上游回话为止。',
+      judgeSystem: '判官的 system 消息：它是谁、只管什么、什么算违规。这个框里就是判官实际用的全文，改完下一轮生效；不能留空。',
+      judgeRules: '逐条打分的规则 + 0/2/4/6/8/10 六档量表；框里就是判官实际用的全文，想收紧给分就改这里；不能留空。',
     }
 
     function Switch({ checked, onChange, disabled }) {
@@ -871,6 +884,27 @@ window.__ModuleLoader__.load({
               rows: 3,
               placeholder: '例：这一轮明确要了「详细说 / 完整版」→ 长和细都不算违规',
               onChange: (event) => patchDraft((next) => { next.exceptions = event.target.value }),
+            }),
+          ),
+
+          // ── 判官提示词（v1.7.0：跟判据一样随便改，改完下一轮生效） ──
+          h(
+            'section',
+            { className: 'qg-section' },
+            h('header', null, h('h2', null, '判官提示词'), h('span', null, '决定判官松紧 · 跟判据一样随便改')),
+            h('div', { className: 'qg-row-help', style: { marginBottom: '6px' } }, '① ' + HELP.judgeSystem),
+            h('textarea', {
+              className: 'qg-text',
+              value: draft.judgeSystem,
+              rows: 5,
+              onChange: (event) => patchDraft((next) => { next.judgeSystem = event.target.value }),
+            }),
+            h('div', { className: 'qg-row-help', style: { margin: '14px 0 6px' } }, '② ' + HELP.judgeRules),
+            h('textarea', {
+              className: 'qg-text',
+              value: draft.judgeRules,
+              rows: 12,
+              onChange: (event) => patchDraft((next) => { next.judgeRules = event.target.value }),
             }),
           ),
 
