@@ -3,6 +3,10 @@
   "version": "1.7.3",
   "description": "发消息之前，先让另一个模型读一遍：dsh 插件组合（引擎 hooks + 可视化质检面板）。",
   "type": "module",
+  "scripts": {
+    "test": "node engine/selftest.mjs",
+    "check": "node scripts/check-versions.mjs --remote"
+  },
   "main": "./panel/lib/index.js",
   "exports": {
     ".": "./panel/lib/index.js",

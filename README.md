@@ -121,6 +121,16 @@ npm 从 CLI 11.15.0 起上了[staged publishing](https://docs.npmjs.com/staged-p
 
 `github:wdj20050927/dsh-quality-guard` 这种 git 装法也能装出面板，但不推荐：pnpm 从 git 装不跑 `prepack`，版本号会读成 `0.0.0`，而且上一次失败留下的目录联接会让重跑报 `ERR_PNPM_EPERM`。
 
+### 发版时别再让四处版本对不上
+
+一个版本号在这五个地方各写一遍，漏一处就出现「npm 是最新的、Release 还是旧版、目录站 tarball 指向旧 tag」的错位。仓库里带了个检查脚本，发版前跑一遍：
+
+```bash
+node scripts/check-versions.mjs --remote
+```
+
+它逐条核对：三份 `package.json`（根 / `panel` / `engine`）同版本、manifest 不带 BOM、README 与 CHANGELOG 提到当前版本、README 没有残留旧 tag 直链、npm `dist-tags.latest`、对应 tag 的 GitHub Release 有 `.tgz` 资产、目录站条目里 `tarball:` 指向的 tag。全一致 exit 0，有一处不一致 exit 1 并列出是哪一处。不加 `--remote` 就只查本地文件。
+
 ### 默认是演习模式
 
 装完 `dryRun: true`——只判断、只记日志（`~/.dsh/quality-guard/audit.jsonl`）、**不打回**。先看几天日志，确认判官判得对，再去面板把「演习模式」关掉。这是故意的：刚装上就真打回，你会被一条判据不合口味反复回炉。
